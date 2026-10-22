@@ -1,5 +1,9 @@
 # WinRTCS physical canary. Signature and component hashes are checked before the token prompt.
 # UPDATE_V2_INCLUDED=false
+# CANARY_DESKTOP_DETACH=1
+param(
+    [switch]$Detached
+)
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
@@ -14,6 +18,122 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
     Write-Output 'FAILURE_CODE=ADMINISTRATOR_REQUIRED'
     exit 1
+}
+if (-not $Detached) {
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Write-Output 'FAILURE_CODE=DETACH_PATH_UNKNOWN'
+        exit 4
+    }
+    $owners = New-Object System.Collections.Generic.List[string]
+    foreach ($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe'")) {
+        $owner = $proc.GetOwner()
+        if ($owner.ReturnValue -eq 0 -and $owner.User -and $owner.Domain) {
+            $owners.Add(('{0}\{1}' -f $owner.Domain, $owner.User))
+        }
+    }
+    $uniqueOwners = @($owners | Select-Object -Unique)
+    $desktopUser = $null
+    if ($uniqueOwners.Count -eq 1) {
+        $desktopUser = $uniqueOwners[0]
+    } elseif ($uniqueOwners.Count -gt 1) {
+        $preference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $sessionLines = @(& quser.exe 2>&1 | ForEach-Object { "$_" })
+        $ErrorActionPreference = $preference
+        $activeName = $null
+        foreach ($line in $sessionLines) {
+            if ($line -match '^\s*>?(\S+)\s+\S+\s+\d+\s+Active\b') {
+                $activeName = $Matches[1]
+                break
+            }
+        }
+        foreach ($candidate in $uniqueOwners) {
+            if ($activeName -and $candidate.EndsWith('\' + $activeName)) {
+                $desktopUser = $candidate
+                break
+            }
+        }
+    }
+    if (-not $desktopUser) {
+        Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Write-Output 'FAILURE_CODE=NO_INTERACTIVE_DESKTOP'
+        Write-Output 'Open the remote desktop so a user session is active, then run this command again.'
+        exit 4
+    }
+    $wrapperPath = Join-Path $env:TEMP 'winrtcs_canary_window.ps1'
+    $xmlPath = Join-Path $env:TEMP 'winrtcs-canary-interactive.xml'
+    $wrapper = @'
+$Host.UI.RawUI.WindowTitle = 'WinRTCS enrollment'
+Write-Output 'WinRTCS enrollment window.'
+Write-Output 'Enter the one-time enrollment token when asked. It stays off the command line.'
+& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File '__LAUNCHER__' -Detached
+$code = $LASTEXITCODE
+Write-Output ('WINRTCS_LAUNCHER_EXIT=' + $code)
+[IO.File]::WriteAllText((Join-Path $env:TEMP 'winrtcs-canary-result.txt'), ('WINRTCS_LAUNCHER_EXIT=' + $code))
+Read-Host 'Press Enter to close this window'
+'@
+    $quotedLauncher = $PSCommandPath.Replace("'", "''")
+    [IO.File]::WriteAllText($wrapperPath, $wrapper.Replace('__LAUNCHER__', $quotedLauncher))
+    $taskArgs = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $wrapperPath + '"'
+    $xmlUser = $desktopUser.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    $xmlArgs = $taskArgs.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <UserId>$xmlUser</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT4H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>$xmlArgs</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+    $utf16 = New-Object System.Text.UnicodeEncoding $false, $true
+    [IO.File]::WriteAllText($xmlPath, $xml, $utf16)
+    $preference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & schtasks.exe /End /TN 'WinRTCSCanaryInteractive' | Out-Null
+    $createText = @(& schtasks.exe /Create /TN 'WinRTCSCanaryInteractive' /XML $xmlPath /F 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $createCode = $LASTEXITCODE
+    $runText = ''
+    $runCode = 1
+    if ($createCode -eq 0) {
+        $runText = @(& schtasks.exe /Run /TN 'WinRTCSCanaryInteractive' 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        $runCode = $LASTEXITCODE
+    }
+    $ErrorActionPreference = $preference
+    Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
+    if ($createCode -ne 0 -or $runCode -ne 0) {
+        Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Write-Output 'FAILURE_CODE=SCHEDULER_DETACH_FAILED'
+        if ($createText) { Write-Output $createText }
+        if ($runText) { Write-Output $runText }
+        exit 4
+    }
+    Write-Output 'WINRTCS_CANARY_DETACHED=true'
+    Write-Output 'TOKEN_WINDOW=DESKTOP'
+    Write-Output 'Type the one-time enrollment token in the PowerShell window on the remote desktop. Do not type it in this command box.'
+    exit 0
 }
 $prior = $null
 try {
