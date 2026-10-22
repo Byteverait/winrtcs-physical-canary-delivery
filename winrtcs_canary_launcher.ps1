@@ -3,6 +3,7 @@
 # CANARY_UNATTENDED=1
 param(
     [switch]$Continue,
+    [switch]$PostReboot,
     [string]$StagePath = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
 if ($null -ne [Net.ServicePointManager]::ServerCertificateValidationCallback) {
     Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Write-Output 'STATE=FAILED'
     Write-Output 'FAILURE_CODE=TLS_CALLBACK'
     exit 2
 }
@@ -17,6 +19,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Write-Output 'STATE=FAILED'
     Write-Output 'FAILURE_CODE=ADMINISTRATOR_REQUIRED'
     exit 1
 }
@@ -34,6 +37,13 @@ function Write-CanaryLog([string]$Line) {
 function Emit([string]$Line) {
     Write-Output $Line
     Write-CanaryLog $Line
+    if ($Line -eq 'WINRTCS_PHYSICAL_CANARY=FAIL') {
+        Write-Output 'STATE=FAILED'
+        Write-CanaryLog 'STATE=FAILED'
+    } elseif ($Line -eq 'WINRTCS_PHYSICAL_CANARY=PASS' -or $Line -eq 'WINRTCS_PHYSICAL_CANARY=ALREADY_INSTALLED') {
+        Write-Output 'STATE=SUCCEEDED'
+        Write-CanaryLog 'STATE=SUCCEEDED'
+    }
 }
 function Initialize-CanaryLog {
     $createdRoot = -not (Test-Path -LiteralPath $script:CanaryRoot)
@@ -64,7 +74,18 @@ function Get-Sha256File([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 function Receive-File([string]$Name, [string]$Dest) {
-    Invoke-WebRequest -Uri ($SoftwareBase + '/' + $Name) -OutFile $Dest -UseBasicParsing
+    for ($try = 1; $try -le 3; $try++) {
+        try {
+            Invoke-WebRequest -Uri ($SoftwareBase + '/' + $Name) -OutFile $Dest -UseBasicParsing
+            return
+        } catch {
+            if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+        }
+    }
+    Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Emit 'STATE=FAILED'
+    Emit 'FAILURE_CODE=DOWNLOAD'
+    exit 3
 }
 function Test-ServiceRunning([string]$Name) {
     $preference = $ErrorActionPreference
@@ -73,30 +94,198 @@ function Test-ServiceRunning([string]$Name) {
     $ErrorActionPreference = $preference
     return $out -match 'STATE\s+:\s+4\s+RUNNING'
 }
+function Register-CanaryReboot([string]$Enroll) {
+    $launcherCopy = Join-Path $script:CanaryRoot 'winrtcs_canary_launcher.ps1'
+    Copy-Item -LiteralPath $PSCommandPath -Destination $launcherCopy -Force
+    & icacls.exe $launcherCopy /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    $taskArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $launcherCopy + '" -PostReboot'
+    $xmlArgs = $taskArgs.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    $xmlPath = Join-Path $script:CanaryRoot 'canary-reboot.xml'
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><BootTrigger><Enabled>true</Enabled><Delay>PT30S</Delay></BootTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author"><Exec>
+    <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+    <Arguments>$xmlArgs</Arguments>
+  </Exec></Actions>
+</Task>
+"@
+    $utf16 = New-Object System.Text.UnicodeEncoding $false, $true
+    [IO.File]::WriteAllText($xmlPath, $xml, $utf16)
+    $preference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & schtasks.exe /Create /TN 'WinRTCSCanaryResume' /XML $xmlPath /F 2>&1 | Out-Null
+    $createCode = $LASTEXITCODE
+    if ($createCode -eq 0) {
+        & schtasks.exe /Delete /TN 'WinRTCSBootstrapResume' /F 2>&1 | Out-Null
+    }
+    $ErrorActionPreference = $preference
+    Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
+    if ($createCode -ne 0) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=REBOOT_TASK'
+        exit 4
+    }
+    if ($Enroll -and (Test-Path -LiteralPath $Enroll)) { Remove-Item -LiteralPath $Enroll -Force }
+    Emit 'STATE=IN_PROGRESS'
+    Emit 'REBOOT_REQUIRED=true'
+    & shutdown.exe /r /t 0 /f | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=REBOOT_START'
+        exit 4
+    }
+    exit 0
+}
+function Invoke-PostReboot {
+    $preference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & schtasks.exe /Delete /TN 'WinRTCSCanaryResume' /F 2>&1 | Out-Null
+    $ErrorActionPreference = 'Stop'
+    Emit 'STATE=IN_PROGRESS'
+    $keeper = Join-Path $script:CanaryRoot 'winrtcs_keeper.ps1'
+    $continuity = Join-Path $script:CanaryRoot 'winrtcs_continuity.ps1'
+    $version = 'C:\ProgramData\Microsoft\WinRTCS\cache\winrtcs.version'
+    if (-not (Test-Path -LiteralPath $keeper) -or -not (Test-Path -LiteralPath $continuity) -or -not (Test-Path -LiteralPath $version)) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=REBOOT_RESUME_MISSING'
+        exit 4
+    }
+    $ErrorActionPreference = 'Continue'
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $keeper -Action Ensure
+    $keeperCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($keeperCode -ne 0) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=KEEPER_ENSURE'
+        Emit ('INSTALL_EXIT=' + $keeperCode)
+        exit 4
+    }
+    $keeperMap = @{}
+    $keeperStatus = Join-Path $script:CanaryRoot 'keeper-status.txt'
+    if (Test-Path -LiteralPath $keeperStatus) {
+        foreach ($line in [IO.File]::ReadAllLines($keeperStatus)) {
+            $pair = $line.Split('=', 2)
+            if ($pair.Length -eq 2) { $keeperMap[$pair[0].Trim()] = $pair[1].Trim() }
+        }
+    }
+    if ([string]$keeperMap['KEEPER_INSTALL_REBOOT_REQUIRED'] -eq 'true') {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=REBOOT_LOOP'
+        exit 4
+    }
+    if ([string]$keeperMap['KEEPER_HEALTH'] -ne 'HEALTHY') {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=KEEPER_NOT_HEALTHY'
+        exit 4
+    }
+    $ErrorActionPreference = 'Continue'
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Prepare
+    $prepare = $LASTEXITCODE
+    if ($prepare -eq 0) {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Watch | Out-Null
+    }
+    $ErrorActionPreference = 'Stop'
+    if ($prepare -ne 0) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=TASK_CREATE'
+        exit 4
+    }
+    $pulsv = Test-ServiceRunning 'ScreenConnect Client (41b1cb0dd5f78b27)'
+    $seczio = Test-ServiceRunning 'ScreenConnect Client (1432e226cdbd6e78)'
+    if (-not $pulsv -or -not $seczio) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=GUEST_SERVICE_NOT_RUNNING'
+        exit 4
+    }
+    $client = Join-Path $script:CanaryRoot 'winrtcs_device_client.ps1'
+    $ErrorActionPreference = 'Continue'
+    $tick = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $client -Action Tick -WorkDir $script:CanaryRoot 2>&1 | Out-String
+    $ErrorActionPreference = 'Stop'
+    if ($tick -notmatch 'DEVICE_TICK=active') {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=HEARTBEAT_OR_POLL'
+        exit 4
+    }
+    $generation = Get-Sha256File $version
+    $status = ''
+    if (Test-Path 'C:\Windows\Temp\winrtcs-bootstrap-status.txt') {
+        $status = [IO.File]::ReadAllText('C:\Windows\Temp\winrtcs-bootstrap-status.txt')
+    }
+    if ($status -notmatch [regex]::Escape('GENERATION=' + $generation)) {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=GENERATION_MISMATCH'
+        exit 4
+    }
+    $resumeFile = Join-Path $script:CanaryRoot 'bootstrap-resume.txt'
+    if (Test-Path -LiteralPath $resumeFile) { Remove-Item -LiteralPath $resumeFile -Force }
+    Emit 'WINRTCS_PHYSICAL_CANARY=PASS'
+    Emit 'STATE=SUCCEEDED'
+    Emit ('GENERATION=' + $generation)
+    Emit 'DEVICE_STATE=DEVICE_ACTIVE'
+    Emit 'PULSV=RUNNING'
+    Emit 'SECZIO=RUNNING'
+    Emit 'HEARTBEAT=PASS'
+    Emit 'POLL=PASS'
+    exit 0
+}
 
 Initialize-CanaryLog
+if ($PostReboot) {
+    Invoke-PostReboot
+}
 $installed = (Test-ServiceRunning 'ScreenConnect Client (41b1cb0dd5f78b27)') -and (Test-ServiceRunning 'ScreenConnect Client (1432e226cdbd6e78)') -and (Test-Path -LiteralPath 'C:\ProgramData\WinRTCS\winrtcs_device_client.ps1')
 if ($installed -and -not $Continue) {
     Emit 'WINRTCS_PHYSICAL_CANARY=ALREADY_INSTALLED'
+    Emit 'STATE=SUCCEEDED'
     Emit 'PULSV=RUNNING'
     Emit 'SECZIO=RUNNING'
     exit 0
 }
 $installTask = Get-CanaryTask 'WinRTCSCanaryInstall'
-if ((-not $installTask.Absent) -and $installTask.State -eq 'Running' -and -not $Continue) {
-    Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-    Emit 'FAILURE_CODE=ALREADY_RUNNING'
-    exit 4
+$canaryResume = Get-CanaryTask 'WinRTCSCanaryResume'
+if (-not $Continue -and ((-not $installTask.Absent -and $installTask.State -eq 'Running') -or (-not $canaryResume.Absent -and $canaryResume.State -eq 'Running'))) {
+    Emit 'STATE=IN_PROGRESS'
+    exit 0
+}
+$resumeFile = Join-Path $script:CanaryRoot 'bootstrap-resume.txt'
+if (-not $Continue -and (Test-Path -LiteralPath $resumeFile) -and ([IO.File]::ReadAllText($resumeFile) -match 'PHASE=POST_KEEPER')) {
+    if ($canaryResume.Absent) { Register-CanaryReboot '' }
+    Emit 'STATE=IN_PROGRESS'
+    Emit 'REBOOT_REQUIRED=true'
+    exit 0
 }
 $resume = Get-CanaryTask 'WinRTCSBootstrapResume'
 if ((-not $resume.Absent) -and -not $Continue) {
     Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Emit 'STATE=FAILED'
     Emit 'FAILURE_CODE=INSTALL_STORM'
     exit 4
 }
 
 function Invoke-CanaryTail([string]$Stage, [string]$Enroll) {
-    Emit 'STATE=INSTALLING'
+    Emit 'STATE=IN_PROGRESS'
     $bootstrap = Join-Path $Stage 'winrtcs_zero_state_bootstrap.ps1'
     $version = Join-Path $Stage 'winrtcs.version'
     Remove-Item Env:WINRTCS_LAB_REBOOT_ALLOWED -ErrorAction SilentlyContinue
@@ -105,16 +294,16 @@ function Invoke-CanaryTail([string]$Stage, [string]$Enroll) {
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $bootstrap -DeviceBase $DeviceBase -EnrollmentFile $Enroll -SoftwareBase $SoftwareBase
     $code = $LASTEXITCODE
     $ErrorActionPreference = $preference
-    if ($code -eq 4) {
-        $ErrorActionPreference = 'Continue'
-        & schtasks.exe /Delete /TN WinRTCSBootstrapResume /F 2>&1 | Out-Null
-        $ErrorActionPreference = 'Stop'
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'FAILURE_CODE=REBOOT_RESUME_NOT_QUALIFIED'
-        exit 4
+    $status = ''
+    if (Test-Path 'C:\Windows\Temp\winrtcs-bootstrap-status.txt') {
+        $status = [IO.File]::ReadAllText('C:\Windows\Temp\winrtcs-bootstrap-status.txt')
+    }
+    if ($code -eq 4 -and $status -match 'REBOOT_RESUME=armed' -and $status -notmatch 'INSTALL_BLOCKED=reboot-loop') {
+        Register-CanaryReboot $Enroll
     }
     if ($code -ne 0) {
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
         Emit 'FAILURE_CODE=INSTALL_FAILED'
         Emit ('INSTALL_EXIT=' + $code)
         exit $code
@@ -242,31 +431,39 @@ try {
         }
     }
     Emit 'STATE=CLAIMING'
-    $request = [Net.HttpWebRequest]::Create([Uri]($DeviceBase + '/device/control/bootstrap/claim'))
-    $request.Method = 'POST'
-    $request.Timeout = 20000
-    $request.AllowAutoRedirect = $false
-    $request.ContentType = 'application/json'
-    $bodyBytes = [Text.Encoding]::ASCII.GetBytes('{}')
-    $request.ContentLength = $bodyBytes.Length
-    $stream = $request.GetRequestStream()
-    try { $stream.Write($bodyBytes, 0, $bodyBytes.Length) } finally { $stream.Close() }
     $token = $null
-    try {
-        $response = $request.GetResponse()
+    $claimFailure = 'CLAIM_UNREACHABLE'
+    for ($try = 1; $try -le 3 -and [string]::IsNullOrWhiteSpace($token); $try++) {
+        $request = [Net.HttpWebRequest]::Create([Uri]($DeviceBase + '/device/control/bootstrap/claim'))
+        $request.Method = 'POST'
+        $request.Timeout = 20000
+        $request.AllowAutoRedirect = $false
+        $request.ContentType = 'application/json'
+        $bodyBytes = [Text.Encoding]::ASCII.GetBytes('{}')
+        $request.ContentLength = $bodyBytes.Length
+        $stream = $request.GetRequestStream()
+        try { $stream.Write($bodyBytes, 0, $bodyBytes.Length) } finally { $stream.Close() }
         try {
-            $reader = New-Object IO.StreamReader($response.GetResponseStream())
-            try { $payload = $reader.ReadToEnd() } finally { $reader.Close() }
-        } finally { $response.Close() }
-        $parsed = $payload | ConvertFrom-Json
-        $token = [string]$parsed.token
-        $payload = $null
-        $parsed = $null
-    } catch [Net.WebException] {
-        $statusCode = 0
-        if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+            $response = $request.GetResponse()
+            try {
+                $reader = New-Object IO.StreamReader($response.GetResponseStream())
+                try { $payload = $reader.ReadToEnd() } finally { $reader.Close() }
+            } finally { $response.Close() }
+            $parsed = $payload | ConvertFrom-Json
+            $token = [string]$parsed.token
+            $payload = $null
+            $parsed = $null
+        } catch [Net.WebException] {
+            $statusCode = 0
+            if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+            if ($statusCode -eq 403) { $claimFailure = 'CLAIM_DENIED'; break }
+            if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -and $claimFailure -eq 'CLAIM_UNREACHABLE') {
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        if ($statusCode -eq 403) { Emit 'FAILURE_CODE=CLAIM_DENIED' } else { Emit 'FAILURE_CODE=CLAIM_UNREACHABLE' }
+        Emit 'STATE=FAILED'
+        Emit 'FAILURE_CODE=CLAIM_UNREACHABLE'
         exit 3
     }
     if ([string]::IsNullOrWhiteSpace($token)) {
