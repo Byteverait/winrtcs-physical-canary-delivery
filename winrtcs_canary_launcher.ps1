@@ -9,20 +9,6 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
-if ($null -ne [Net.ServicePointManager]::ServerCertificateValidationCallback) {
-    Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
-    Write-Output 'STATE=FAILED'
-    Write-Output 'FAILURE_CODE=TLS_CALLBACK'
-    exit 2
-}
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Output 'WINRTCS_PHYSICAL_CANARY=FAIL'
-    Write-Output 'STATE=FAILED'
-    Write-Output 'FAILURE_CODE=ADMINISTRATOR_REQUIRED'
-    exit 1
-}
 $SoftwareBase = 'https://raw.githubusercontent.com/Byteverait/winrtcs-physical-canary-delivery/main'
 $DeviceBase = 'https://device.seczio.com'
 $ExpectedBootstrap = '0a62d34817f218df4cdf17f48b6d56ac767131843614842360551c7ab58880b7'
@@ -32,7 +18,10 @@ $script:CanaryRoot = 'C:\ProgramData\WinRTCS'
 function Write-CanaryLog([string]$Line) {
     if ($Line -match '(?i)token=|sig=|BEGIN ') { return }
     $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    [IO.File]::AppendAllText($script:CanaryLog, ($stamp + ' ' + $Line + "`r`n"))
+    $text = $stamp + ' ' + $Line + "`r`n"
+    foreach ($path in @($script:CanaryLog, 'C:\Windows\Temp\winrtcs-canary-diagnostic.log')) {
+        try { [IO.File]::AppendAllText($path, $text) } catch { }
+    }
 }
 function Emit([string]$Line) {
     Write-Output $Line
@@ -46,15 +35,20 @@ function Emit([string]$Line) {
     }
 }
 function Initialize-CanaryLog {
-    $createdRoot = -not (Test-Path -LiteralPath $script:CanaryRoot)
-    if ($createdRoot) {
+    $script:CanaryRootCreated = -not (Test-Path -LiteralPath $script:CanaryRoot)
+    if ($script:CanaryRootCreated) {
         New-Item -ItemType Directory -Path $script:CanaryRoot | Out-Null
-        & icacls.exe $script:CanaryRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
     }
     if (-not (Test-Path -LiteralPath $script:CanaryLog)) {
         [IO.File]::WriteAllText($script:CanaryLog, '')
     }
-    & icacls.exe $script:CanaryLog /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+}
+function Protect-CanaryLog {
+    if ($script:CanaryRootCreated) {
+        & icacls.exe $script:CanaryRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+    }
+    $reader = '*' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value + ':(R)'
+    & icacls.exe $script:CanaryLog /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' $reader | Out-Null
 }
 function Get-CanaryTask([string]$Name) {
     $found = [pscustomobject]@{ Absent = $true; State = '' }
@@ -252,6 +246,22 @@ function Invoke-PostReboot {
 }
 
 Initialize-CanaryLog
+Emit 'LAUNCHER_STARTED=true'
+Emit 'LOG=C:\ProgramData\WinRTCS\canary-install.log'
+if ($null -ne [Net.ServicePointManager]::ServerCertificateValidationCallback) {
+    Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Emit 'FAILURE_CODE=TLS_CALLBACK'
+    exit 2
+}
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Emit 'FAILURE_CODE=ADMINISTRATOR_REQUIRED'
+    exit 1
+}
+Protect-CanaryLog
+Emit 'STATE=IN_PROGRESS'
 if ($PostReboot) {
     Invoke-PostReboot
 }
@@ -544,6 +554,11 @@ exit $code
     Emit 'LOG=C:\ProgramData\WinRTCS\canary-install.log'
     Emit 'STATE=STARTED'
     exit 0
+} catch {
+    Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+    Emit 'FAILURE_CODE=STAGE'
+    Emit ('STAGE_ERROR=' + $_.Exception.GetType().Name)
+    exit 3
 } finally {
     if ($cleanup -and (Test-Path -LiteralPath $stage)) {
         Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
