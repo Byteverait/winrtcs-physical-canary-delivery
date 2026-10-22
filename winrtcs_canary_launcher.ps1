@@ -9,16 +9,44 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
+[Net.ServicePointManager]::Expect100Continue = $false
 $SoftwareBase = 'https://raw.githubusercontent.com/Byteverait/winrtcs-physical-canary-delivery/main'
 $DeviceBase = 'https://device.seczio.com'
 $ExpectedBootstrap = '0a62d34817f218df4cdf17f48b6d56ac767131843614842360551c7ab58880b7'
 $script:CanaryLog = 'C:\ProgramData\WinRTCS\canary-install.log'
 $script:CanaryRoot = 'C:\ProgramData\WinRTCS'
 
+function Protect-CanaryText([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $safe = [regex]::Replace($Text, '(?i)(token|sig)=[^\s]+', '${1}=REDACTED')
+    $safe = [regex]::Replace($safe, '(?i)-----BEGIN [A-Z0-9 ]+-----', 'BEGIN REDACTED')
+    $safe = [regex]::Replace($safe, '[\r\n]+', ' ')
+    if ($safe.Length -gt 180) { $safe = $safe.Substring(0, 180) }
+    return $safe
+}
+function Get-CanaryErrorText($Record) {
+    $current = $null
+    if ($null -ne $Record) { $current = $Record.Exception }
+    $names = New-Object System.Collections.Generic.List[string]
+    $status = ''
+    $message = ''
+    while ($null -ne $current) {
+        [void]$names.Add($current.GetType().Name)
+        if (-not $status -and $current -is [Net.WebException]) { $status = [string]$current.Status }
+        if (-not $message -and $current.Message) { $message = [string]$current.Message }
+        $current = $current.InnerException
+    }
+    $chain = ''
+    if ($names.Count -gt 0) { $chain = ($names -join '/') }
+    return [pscustomobject]@{ Chain = $chain; Status = $status; Message = (Protect-CanaryText $message) }
+}
 function Write-CanaryLog([string]$Line) {
-    if ($Line -match '(?i)token=|sig=|BEGIN ') { return }
+    $safe = [regex]::Replace($Line, '(?i)(token|sig)=[^\s]+', '${1}=REDACTED')
+    $safe = [regex]::Replace($safe, '(?i)-----BEGIN [A-Z0-9 ]+-----', 'BEGIN REDACTED')
+    if ($safe -match '(?i)(token|sig)=(?!REDACTED)') { return }
+    if ($safe -match '(?i)BEGIN (?!REDACTED)') { return }
     $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $text = $stamp + ' ' + $Line + "`r`n"
+    $text = $stamp + ' ' + $safe + "`r`n"
     foreach ($path in @($script:CanaryLog, 'C:\Windows\Temp\winrtcs-canary-diagnostic.log')) {
         try { [IO.File]::AppendAllText($path, $text) } catch { }
     }
@@ -443,31 +471,70 @@ try {
     Emit 'STATE=CLAIMING'
     $token = $null
     $claimFailure = 'CLAIM_UNREACHABLE'
-    for ($try = 1; $try -le 3 -and [string]::IsNullOrWhiteSpace($token); $try++) {
-        $request = [Net.HttpWebRequest]::Create([Uri]($DeviceBase + '/device/control/bootstrap/claim'))
-        $request.Method = 'POST'
-        $request.Timeout = 20000
-        $request.AllowAutoRedirect = $false
-        $request.ContentType = 'application/json'
-        $bodyBytes = [Text.Encoding]::ASCII.GetBytes('{}')
-        $request.ContentLength = $bodyBytes.Length
-        $stream = $request.GetRequestStream()
-        try { $stream.Write($bodyBytes, 0, $bodyBytes.Length) } finally { $stream.Close() }
-        try {
-            $response = $request.GetResponse()
+    $claimUrl = $DeviceBase + '/device/control/bootstrap/claim'
+    $curl = Get-Command -Name 'curl.exe' -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $curl) {
+        Emit 'CLAIM_OPERATION=POST'
+        Emit 'CLAIM_ERROR=curl.exe missing'
+    } else {
+        for ($try = 1; $try -le 3 -and [string]::IsNullOrWhiteSpace($token) -and $claimFailure -ne 'CLAIM_DENIED'; $try++) {
+            $requestFile = Join-Path $stage 'claim-request.json'
+            $bodyFile = Join-Path $stage 'claim-body.bin'
+            $codeFile = Join-Path $stage 'claim-http.txt'
+            $errFile = Join-Path $stage 'claim-error.txt'
+            [IO.File]::WriteAllText($requestFile, '{}')
+            $preference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & $curl.Source -sS --http1.1 --tlsv1.2 --connect-timeout 15 --max-time 25 --max-redirs 0 -X POST -H 'Content-Type: application/json' --data-binary ('@' + $requestFile) -o $bodyFile -w '%{http_code}' $claimUrl 1> $codeFile 2> $errFile
+            $curlExit = $LASTEXITCODE
+            $ErrorActionPreference = $preference
+            $httpJoined = ''
+            if (Test-Path -LiteralPath $codeFile) { $httpJoined = ([IO.File]::ReadAllText($codeFile)).Trim() }
+            $httpCode = 0
+            if ($httpJoined -match '^[0-9]{3}$') { $httpCode = [int]$httpJoined }
+            Emit 'CLAIM_OPERATION=POST'
+            Emit ('CLAIM_TRY=' + $try)
+            Emit ('CLAIM_EXIT=' + $curlExit)
+            Emit ('CLAIM_HTTP=' + $httpCode)
+            if ($curlExit -ne 0) {
+                $errText = ''
+                if (Test-Path -LiteralPath $errFile) { $errText = [IO.File]::ReadAllText($errFile) }
+                $safeErr = Protect-CanaryText $errText
+                if ($safeErr) { Emit ('CLAIM_ERROR=' + $safeErr) }
+                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
+                if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+                continue
+            }
+            if ($httpCode -eq 403) {
+                $claimFailure = 'CLAIM_DENIED'
+                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
+                break
+            }
+            if ($httpCode -ne 200) {
+                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
+                if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+                continue
+            }
             try {
-                $reader = New-Object IO.StreamReader($response.GetResponseStream())
-                try { $payload = $reader.ReadToEnd() } finally { $reader.Close() }
-            } finally { $response.Close() }
-            $parsed = $payload | ConvertFrom-Json
-            $token = [string]$parsed.token
-            $payload = $null
-            $parsed = $null
-        } catch [Net.WebException] {
-            $statusCode = 0
-            if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
-            if ($statusCode -eq 403) { $claimFailure = 'CLAIM_DENIED'; break }
-            if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+                $payload = ''
+                if (Test-Path -LiteralPath $bodyFile) { $payload = [IO.File]::ReadAllText($bodyFile) }
+                $parsed = $payload | ConvertFrom-Json
+                $token = [string]$parsed.token
+                $payload = $null
+                $parsed = $null
+            } catch {
+                $detail = Get-CanaryErrorText $_
+                Emit 'CLAIM_OPERATION=PARSE'
+                Emit ('CLAIM_EXCEPTION=' + $detail.Chain)
+                $token = $null
+                $claimFailure = 'CLAIM_DENIED'
+            } finally {
+                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
+            }
+            if ([string]::IsNullOrWhiteSpace($token)) {
+                $claimFailure = 'CLAIM_DENIED'
+                break
+            }
         }
     }
     if ([string]::IsNullOrWhiteSpace($token) -and $claimFailure -eq 'CLAIM_UNREACHABLE') {
@@ -555,9 +622,13 @@ exit $code
     Emit 'STATE=STARTED'
     exit 0
 } catch {
+    $detail = Get-CanaryErrorText $_
     Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
     Emit 'FAILURE_CODE=STAGE'
-    Emit ('STAGE_ERROR=' + $_.Exception.GetType().Name)
+    Emit 'STAGE_OPERATION=foreground'
+    Emit ('STAGE_ERROR=' + $detail.Chain)
+    if ($detail.Status) { Emit ('STAGE_STATUS=' + $detail.Status) }
+    if ($detail.Message) { Emit ('STAGE_DETAIL=' + $detail.Message) }
     exit 3
 } finally {
     if ($cleanup -and (Test-Path -LiteralPath $stage)) {
