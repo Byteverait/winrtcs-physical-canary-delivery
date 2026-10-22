@@ -485,7 +485,7 @@ try {
             [IO.File]::WriteAllText($requestFile, '{}')
             $preference = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
-            & $curl.Source -sS --http1.1 --tlsv1.2 --connect-timeout 15 --max-time 25 --max-redirs 0 -X POST -H 'Content-Type: application/json' --data-binary ('@' + $requestFile) -o $bodyFile -w '%{http_code}' $claimUrl 1> $codeFile 2> $errFile
+            & $curl.Source -sS --http1.1 --tlsv1.2 --tls-max 1.2 --connect-timeout 15 --max-time 25 --max-redirs 0 -X POST -H 'Content-Type: application/json' --data-binary ('@' + $requestFile) -o $bodyFile -w '%{http_code}' $claimUrl 1> $codeFile 2> $errFile
             $curlExit = $LASTEXITCODE
             $ErrorActionPreference = $preference
             $httpJoined = ''
@@ -493,6 +493,7 @@ try {
             $httpCode = 0
             if ($httpJoined -match '^[0-9]{3}$') { $httpCode = [int]$httpJoined }
             Emit 'CLAIM_OPERATION=POST'
+            Emit 'CLAIM_TLS_MAX=1.2'
             Emit ('CLAIM_TRY=' + $try)
             Emit ('CLAIM_EXIT=' + $curlExit)
             Emit ('CLAIM_HTTP=' + $httpCode)
