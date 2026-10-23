@@ -1,4 +1,5 @@
-# WinRTCS physical canary. Signature and component hashes are checked before enrollment.
+# WinRTCS physical canary. Signature and component hashes are checked before any local install.
+# Local installation does not enroll the device. Backend identity stays NOT_ENROLLED.
 # UPDATE_V2_INCLUDED=false
 # CANARY_UNATTENDED=1
 param(
@@ -11,7 +12,6 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
 [Net.ServicePointManager]::Expect100Continue = $false
 $SoftwareBase = 'https://raw.githubusercontent.com/Byteverait/winrtcs-physical-canary-delivery/main'
-$DeviceBase = 'https://device.seczio.com'
 $ExpectedBootstrap = '0a62d34817f218df4cdf17f48b6d56ac767131843614842360551c7ab58880b7'
 $script:CanaryLog = 'C:\ProgramData\WinRTCS\canary-install.log'
 $script:CanaryRoot = 'C:\ProgramData\WinRTCS'
@@ -93,7 +93,24 @@ function Get-CanaryTask([string]$Name) {
     return $found
 }
 function Get-Sha256File([string]$Path) {
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $last = $null
+    for ($try = 1; $try -le 3; $try++) {
+        $hasher = $null
+        $stream = $null
+        try {
+            $hasher = [Security.Cryptography.SHA256]::Create()
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            return ([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        } catch {
+            $last = $_
+            if ($try -ge 3) { throw }
+            Start-Sleep -Seconds $try
+        } finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+            if ($null -ne $hasher) { $hasher.Dispose() }
+        }
+    }
+    throw $last
 }
 function Receive-File([string]$Name, [string]$Dest) {
     for ($try = 1; $try -le 3; $try++) {
@@ -239,38 +256,10 @@ function Invoke-PostReboot {
         Emit 'FAILURE_CODE=GUEST_SERVICE_NOT_RUNNING'
         exit 4
     }
-    $client = Join-Path $script:CanaryRoot 'winrtcs_device_client.ps1'
-    $ErrorActionPreference = 'Continue'
-    $tick = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $client -Action Tick -WorkDir $script:CanaryRoot 2>&1 | Out-String
-    $ErrorActionPreference = 'Stop'
-    if ($tick -notmatch 'DEVICE_TICK=active') {
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'STATE=FAILED'
-        Emit 'FAILURE_CODE=HEARTBEAT_OR_POLL'
-        exit 4
-    }
     $generation = Get-Sha256File $version
-    $status = ''
-    if (Test-Path 'C:\Windows\Temp\winrtcs-bootstrap-status.txt') {
-        $status = [IO.File]::ReadAllText('C:\Windows\Temp\winrtcs-bootstrap-status.txt')
-    }
-    if ($status -notmatch [regex]::Escape('GENERATION=' + $generation)) {
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'STATE=FAILED'
-        Emit 'FAILURE_CODE=GENERATION_MISMATCH'
-        exit 4
-    }
-    $resumeFile = Join-Path $script:CanaryRoot 'bootstrap-resume.txt'
-    if (Test-Path -LiteralPath $resumeFile) { Remove-Item -LiteralPath $resumeFile -Force }
-    Emit 'WINRTCS_PHYSICAL_CANARY=PASS'
-    Emit 'STATE=SUCCEEDED'
     Emit ('GENERATION=' + $generation)
-    Emit 'DEVICE_STATE=DEVICE_ACTIVE'
-    Emit 'PULSV=RUNNING'
-    Emit 'SECZIO=RUNNING'
-    Emit 'HEARTBEAT=PASS'
-    Emit 'POLL=PASS'
-    exit 0
+    Publish-InstallSplit 'SUCCEEDED'
+    exit 4
 }
 
 Initialize-CanaryLog
@@ -295,11 +284,9 @@ if ($PostReboot) {
 }
 $installed = (Test-ServiceRunning 'ScreenConnect Client (41b1cb0dd5f78b27)') -and (Test-ServiceRunning 'ScreenConnect Client (1432e226cdbd6e78)') -and (Test-Path -LiteralPath 'C:\ProgramData\WinRTCS\winrtcs_device_client.ps1')
 if ($installed -and -not $Continue) {
-    Emit 'WINRTCS_PHYSICAL_CANARY=ALREADY_INSTALLED'
-    Emit 'STATE=SUCCEEDED'
+    Emit 'LOCAL_INSTALL_OBSERVED=true'
     Emit 'PULSV=RUNNING'
     Emit 'SECZIO=RUNNING'
-    exit 0
 }
 $installTask = Get-CanaryTask 'WinRTCSCanaryInstall'
 $canaryResume = Get-CanaryTask 'WinRTCSCanaryResume'
@@ -322,72 +309,138 @@ if ((-not $resume.Absent) -and -not $Continue) {
     exit 4
 }
 
-function Invoke-CanaryTail([string]$Stage, [string]$Enroll) {
+function Write-LocalDeviceKey {
+    $keyPath = Join-Path $script:CanaryRoot 'key.json'
+    if (Test-Path -LiteralPath $keyPath) { return }
+    $rsa = [Security.Cryptography.RSA]::Create(2048)
+    try {
+        $parameters = $rsa.ExportParameters($true)
+        $material = [ordered]@{
+            modulus = [Convert]::ToBase64String($parameters.Modulus)
+            exponent = [Convert]::ToBase64String($parameters.Exponent)
+            d = [Convert]::ToBase64String($parameters.D)
+            p = [Convert]::ToBase64String($parameters.P)
+            q = [Convert]::ToBase64String($parameters.Q)
+            dp = [Convert]::ToBase64String($parameters.DP)
+            dq = [Convert]::ToBase64String($parameters.DQ)
+            inverseq = [Convert]::ToBase64String($parameters.InverseQ)
+        }
+        $utf8 = New-Object Text.UTF8Encoding $false
+        [IO.File]::WriteAllText($keyPath, ($material | ConvertTo-Json -Compress), $utf8)
+    } finally { $rsa.Dispose() }
+    & icacls.exe $keyPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+}
+function Publish-InstallSplit([string]$LocalState) {
+    if ($LocalState -eq 'SUCCEEDED') { Write-LocalDeviceKey }
+    Emit ('LOCAL_INSTALL_STATE=' + $LocalState)
+    Emit 'BACKEND_STATE=NOT_ENROLLED'
+    Emit 'BACKEND_REASON=device_tick_requires_enrolled_host_row'
+    Emit 'STATE=FAILED'
+    Emit 'FAILURE_CODE=BACKEND_NOT_ENROLLED'
+    if ($LocalState -eq 'SUCCEEDED') {
+        Emit 'PULSV=RUNNING'
+        Emit 'SECZIO=RUNNING'
+    }
+}
+function Invoke-LocalInstall([string]$Stage) {
     Emit 'STATE=IN_PROGRESS'
-    $bootstrap = Join-Path $Stage 'winrtcs_zero_state_bootstrap.ps1'
-    $version = Join-Path $Stage 'winrtcs.version'
-    Remove-Item Env:WINRTCS_LAB_REBOOT_ALLOWED -ErrorAction SilentlyContinue
+    Emit 'INSTALL_MODE=local'
+    $cache = 'C:\ProgramData\Microsoft\WinRTCS\cache'
+    New-Item -ItemType Directory -Force -Path $cache | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:CanaryRoot | Out-Null
+    $names = @(
+        'winrtcs.version','winrtcs.version.sig',
+        'winrtcs_agent.cmd','winrtcs_guard.cmd','winrtcs_sentinel.cmd','winrtcs_run.cmd',
+        'winrtcs_gen_commit.ps1','winrtcs_device_client.ps1','winrtcs_device.cfg',
+        'winrtcs_continuity.ps1','winrtcs_watchdog.cmd','winrtcs_wdgate.cmd','winrtcs_keeper.ps1'
+    )
+    foreach ($name in $names) {
+        $source = Join-Path $Stage $name
+        if (-not (Test-Path -LiteralPath $source)) {
+            Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+            Emit 'STATE=FAILED'
+            Emit 'LOCAL_INSTALL_STATE=FAILED'
+            Emit 'BACKEND_STATE=NOT_ENROLLED'
+            Emit 'FAILURE_CODE=COMPONENT_MISSING'
+            exit 3
+        }
+        Copy-Item -LiteralPath $source -Destination (Join-Path $cache $name) -Force
+    }
+    $commit = Join-Path $cache 'winrtcs_gen_commit.ps1'
     $preference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $bootstrap -DeviceBase $DeviceBase -EnrollmentFile $Enroll -SoftwareBase $SoftwareBase
-    $code = $LASTEXITCODE
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $commit -Repair
+    $commitCode = $LASTEXITCODE
     $ErrorActionPreference = $preference
-    $status = ''
-    if (Test-Path 'C:\Windows\Temp\winrtcs-bootstrap-status.txt') {
-        $status = [IO.File]::ReadAllText('C:\Windows\Temp\winrtcs-bootstrap-status.txt')
-    }
-    if ($code -eq 4 -and $status -match 'REBOOT_RESUME=armed' -and $status -notmatch 'INSTALL_BLOCKED=reboot-loop') {
-        Register-CanaryReboot $Enroll
-    }
-    if ($code -ne 0) {
+    $commitResult = ''
+    $resultPath = Join-Path $script:CanaryRoot 'gen-commit-result.txt'
+    if (Test-Path -LiteralPath $resultPath) { $commitResult = ([IO.File]::ReadAllText($resultPath)).Trim() }
+    if ($commitCode -ne 0 -or ($commitResult -ne 'NEW_COMPLETE' -and $commitResult -ne 'IDEMPOTENT')) {
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
         Emit 'STATE=FAILED'
-        Emit 'FAILURE_CODE=INSTALL_FAILED'
-        Emit ('INSTALL_EXIT=' + $code)
-        exit $code
+        Emit 'LOCAL_INSTALL_STATE=FAILED'
+        Emit 'BACKEND_STATE=NOT_ENROLLED'
+        Emit 'FAILURE_CODE=GENERATION_COMMIT'
+        Emit ('INSTALL_EXIT=' + $commitCode)
+        exit 4
+    }
+    $keeper = Join-Path $script:CanaryRoot 'winrtcs_keeper.ps1'
+    $ErrorActionPreference = 'Continue'
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $keeper -Action Ensure
+    $keeperCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    $keeperMap = @{}
+    $keeperStatus = Join-Path $script:CanaryRoot 'keeper-status.txt'
+    if (Test-Path -LiteralPath $keeperStatus) {
+        foreach ($line in [IO.File]::ReadAllLines($keeperStatus)) {
+            $pair = $line.Split('=', 2)
+            if ($pair.Length -eq 2) { $keeperMap[$pair[0].Trim()] = $pair[1].Trim() }
+        }
+    }
+    if ([string]$keeperMap['KEEPER_INSTALL_REBOOT_REQUIRED'] -eq 'true') {
+        Emit 'LOCAL_INSTALL_STATE=IN_PROGRESS'
+        Emit 'BACKEND_STATE=NOT_ENROLLED'
+        Register-CanaryReboot ''
+    }
+    if ($keeperCode -ne 0 -or [string]$keeperMap['KEEPER_HEALTH'] -ne 'HEALTHY') {
+        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'LOCAL_INSTALL_STATE=FAILED'
+        Emit 'BACKEND_STATE=NOT_ENROLLED'
+        Emit 'FAILURE_CODE=KEEPER_ENSURE'
+        Emit ('INSTALL_EXIT=' + $keeperCode)
+        exit 4
     }
     $pulsv = Test-ServiceRunning 'ScreenConnect Client (41b1cb0dd5f78b27)'
     $seczio = Test-ServiceRunning 'ScreenConnect Client (1432e226cdbd6e78)'
     if (-not $pulsv -or -not $seczio) {
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
+        Emit 'STATE=FAILED'
+        Emit 'LOCAL_INSTALL_STATE=FAILED'
+        Emit 'BACKEND_STATE=NOT_ENROLLED'
         Emit 'FAILURE_CODE=GUEST_SERVICE_NOT_RUNNING'
         exit 4
     }
-    $client = 'C:\ProgramData\WinRTCS\winrtcs_device_client.ps1'
-    $preference = $ErrorActionPreference
+    $continuity = Join-Path $script:CanaryRoot 'winrtcs_continuity.ps1'
     $ErrorActionPreference = 'Continue'
-    $tick = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $client -Action Tick -WorkDir 'C:\ProgramData\WinRTCS' 2>&1 | Out-String
-    $ErrorActionPreference = $preference
-    if ($tick -notmatch 'DEVICE_TICK=active') {
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Prepare
+    $prepare = $LASTEXITCODE
+    if ($prepare -eq 0) {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Watch | Out-Null
+    }
+    $ErrorActionPreference = 'Stop'
+    if ($prepare -ne 0) {
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'FAILURE_CODE=HEARTBEAT_OR_POLL'
+        Emit 'STATE=FAILED'
+        Emit 'LOCAL_INSTALL_STATE=FAILED'
+        Emit 'BACKEND_STATE=NOT_ENROLLED'
+        Emit 'FAILURE_CODE=TASK_CREATE'
         exit 4
     }
-    $generation = Get-Sha256File $version
-    $status = ''
-    if (Test-Path 'C:\Windows\Temp\winrtcs-bootstrap-status.txt') {
-        $status = [IO.File]::ReadAllText('C:\Windows\Temp\winrtcs-bootstrap-status.txt')
-    }
-    if ($status -notmatch [regex]::Escape('GENERATION=' + $generation)) {
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'FAILURE_CODE=GENERATION_MISMATCH'
-        exit 4
-    }
-    $pins = @{}
-    foreach ($line in [IO.File]::ReadAllLines($version)) {
-        $pair = $line.Split('=', 2)
-        if ($pair.Length -eq 2) { $pins[$pair[0].Trim()] = $pair[1].Trim() }
-    }
-    Emit 'WINRTCS_PHYSICAL_CANARY=PASS'
-    Emit ('VERSION=' + [string]$pins['WINRTCS_VER'])
+    $generation = Get-Sha256File (Join-Path $cache 'winrtcs.version')
     Emit ('GENERATION=' + $generation)
-    Emit 'DEVICE_STATE=DEVICE_ACTIVE'
-    Emit 'PULSV=RUNNING'
-    Emit 'SECZIO=RUNNING'
-    Emit 'HEARTBEAT=PASS'
-    Emit 'POLL=PASS'
-    Emit 'UPDATE_V2=DEFERRED_CANARY_SCOPE'
-    exit 0
+    Publish-InstallSplit 'SUCCEEDED'
+    exit 4
 }
 
 if ($Continue) {
@@ -396,13 +449,7 @@ if ($Continue) {
         Emit 'FAILURE_CODE=STAGE_PATH'
         exit 4
     }
-    $enroll = Join-Path $StagePath 'enroll.txt'
-    if (-not (Test-Path -LiteralPath $enroll)) {
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'FAILURE_CODE=ENROLLMENT_FILE_MISSING'
-        exit 3
-    }
-    Invoke-CanaryTail $StagePath $enroll
+    Invoke-LocalInstall $StagePath
 }
 
 $stage = Join-Path $env:TEMP ('winrtcs-canary-' + [guid]::NewGuid().ToString('n'))
@@ -468,92 +515,7 @@ try {
             exit 3
         }
     }
-    Emit 'STATE=CLAIMING'
-    $token = $null
-    $claimFailure = 'CLAIM_UNREACHABLE'
-    $claimUrl = $DeviceBase + '/device/control/bootstrap/claim'
-    $curl = Get-Command -Name 'curl.exe' -CommandType Application -ErrorAction SilentlyContinue
-    if ($null -eq $curl) {
-        Emit 'CLAIM_OPERATION=POST'
-        Emit 'CLAIM_ERROR=curl.exe missing'
-    } else {
-        for ($try = 1; $try -le 3 -and [string]::IsNullOrWhiteSpace($token) -and $claimFailure -ne 'CLAIM_DENIED'; $try++) {
-            $requestFile = Join-Path $stage 'claim-request.json'
-            $bodyFile = Join-Path $stage 'claim-body.bin'
-            $codeFile = Join-Path $stage 'claim-http.txt'
-            $errFile = Join-Path $stage 'claim-error.txt'
-            [IO.File]::WriteAllText($requestFile, '{}')
-            $preference = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            & $curl.Source -sS --http1.1 --tlsv1.2 --tls-max 1.2 --connect-timeout 15 --max-time 25 --max-redirs 0 -X POST -H 'Content-Type: application/json' --data-binary ('@' + $requestFile) -o $bodyFile -w '%{http_code}' $claimUrl 1> $codeFile 2> $errFile
-            $curlExit = $LASTEXITCODE
-            $ErrorActionPreference = $preference
-            $httpJoined = ''
-            if (Test-Path -LiteralPath $codeFile) { $httpJoined = ([IO.File]::ReadAllText($codeFile)).Trim() }
-            $httpCode = 0
-            if ($httpJoined -match '^[0-9]{3}$') { $httpCode = [int]$httpJoined }
-            Emit 'CLAIM_OPERATION=POST'
-            Emit 'CLAIM_TLS_MAX=1.2'
-            Emit ('CLAIM_TRY=' + $try)
-            Emit ('CLAIM_EXIT=' + $curlExit)
-            Emit ('CLAIM_HTTP=' + $httpCode)
-            if ($curlExit -ne 0) {
-                $errText = ''
-                if (Test-Path -LiteralPath $errFile) { $errText = [IO.File]::ReadAllText($errFile) }
-                $safeErr = Protect-CanaryText $errText
-                if ($safeErr) { Emit ('CLAIM_ERROR=' + $safeErr) }
-                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
-                if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
-                continue
-            }
-            if ($httpCode -eq 403) {
-                $claimFailure = 'CLAIM_DENIED'
-                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
-                break
-            }
-            if ($httpCode -ne 200) {
-                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
-                if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
-                continue
-            }
-            try {
-                $payload = ''
-                if (Test-Path -LiteralPath $bodyFile) { $payload = [IO.File]::ReadAllText($bodyFile) }
-                $parsed = $payload | ConvertFrom-Json
-                $token = [string]$parsed.token
-                $payload = $null
-                $parsed = $null
-            } catch {
-                $detail = Get-CanaryErrorText $_
-                Emit 'CLAIM_OPERATION=PARSE'
-                Emit ('CLAIM_EXCEPTION=' + $detail.Chain)
-                $token = $null
-                $claimFailure = 'CLAIM_DENIED'
-            } finally {
-                Remove-Item -LiteralPath $bodyFile, $codeFile, $errFile, $requestFile -Force -ErrorAction SilentlyContinue
-            }
-            if ([string]::IsNullOrWhiteSpace($token)) {
-                $claimFailure = 'CLAIM_DENIED'
-                break
-            }
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($token) -and $claimFailure -eq 'CLAIM_UNREACHABLE') {
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'STATE=FAILED'
-        Emit 'FAILURE_CODE=CLAIM_UNREACHABLE'
-        exit 3
-    }
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        $token = $null
-        Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
-        Emit 'FAILURE_CODE=CLAIM_DENIED'
-        exit 3
-    }
-    $enroll = Join-Path $stage 'enroll.txt'
-    $utf8 = New-Object Text.UTF8Encoding $false
-    [IO.File]::WriteAllText($enroll, $token.Trim(), $utf8)
-    $token = $null
+    Emit 'INSTALL_MODE=local'
     $runId = [guid]::NewGuid().ToString('n')
     $wrapper = @'
 & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -Continue -StagePath '__STAGE__'
