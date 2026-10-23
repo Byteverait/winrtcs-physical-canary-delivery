@@ -250,8 +250,10 @@ function Invoke-PostReboot {
     $ErrorActionPreference = 'Continue'
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Prepare
     $prepare = $LASTEXITCODE
+    $watchExit = -1
     if ($prepare -eq 0) {
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Watch | Out-Null
+        $watchExit = $LASTEXITCODE
     }
     $ErrorActionPreference = 'Stop'
     if ($prepare -ne 0) {
@@ -270,8 +272,8 @@ function Invoke-PostReboot {
     }
     $generation = Get-Sha256File $version
     Emit ('GENERATION=' + $generation)
-    Publish-InstallSplit 'SUCCEEDED'
-    exit 4
+    Publish-InstallSplit 'SUCCEEDED' $keeperMap $watchExit
+    exit 0
 }
 
 Initialize-CanaryLog
@@ -342,16 +344,40 @@ function Write-LocalDeviceKey {
     } finally { $rsa.Dispose() }
     & icacls.exe $keyPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
 }
-function Publish-InstallSplit([string]$LocalState) {
+function Publish-InstallSplit([string]$LocalState, [hashtable]$Keeper, [int]$WatchExit) {
     if ($LocalState -eq 'SUCCEEDED') { Write-LocalDeviceKey }
+    $continuityStatus = Join-Path $script:CanaryRoot 'continuity-status.txt'
+    $watchdog = 'ABSENT'
+    if (Test-Path -LiteralPath $continuityStatus) {
+        foreach ($line in [IO.File]::ReadAllLines($continuityStatus)) {
+            if ($line.StartsWith('watchdog=')) { $watchdog = $line.Substring(9).Trim() }
+        }
+    }
     Emit ('LOCAL_INSTALL_STATE=' + $LocalState)
-    Emit 'BACKEND_STATE=NOT_ENROLLED'
-    Emit 'BACKEND_REASON=device_tick_requires_enrolled_host_row'
-    Emit 'STATE=FAILED'
-    Emit 'FAILURE_CODE=BACKEND_NOT_ENROLLED'
+    Emit 'CORE_FILES=PRESENT'
+    Emit 'CORE_STATE=INSTALLED'
+    Emit 'CORE_OPERATION=NOT_PROVEN'
+    Emit ('CONTINUITY_WATCH_EXIT=' + $WatchExit)
+    Emit ('CONTINUITY_WATCHDOG=' + $watchdog)
+    $primary = [string]$Keeper['primary_local_health']
+    $backup = [string]$Keeper['backup_local_health']
+    Emit ('PULSV_SERVICE=' + $(if ($primary -eq 'HEALTHY') { 'RUNNING' } else { 'UNVERIFIED' }))
+    Emit 'PULSV_FUNCTIONAL=UNVERIFIED'
+    Emit 'PULSV_REASON=primary_relay_reachability=not_checked'
+    Emit ('BACKUP_SERVICE=' + $(if ($backup -eq 'HEALTHY') { 'RUNNING' } else { 'UNVERIFIED' }))
+    Emit 'BACKUP_FUNCTIONAL=UNVERIFIED'
+    Emit 'BACKUP_REASON=relay_not_checked'
+    Emit 'TACTICAL_STATE=NOT_INTEGRATED'
+    Emit 'TACTICAL_REASON=server_queue_token_required'
+    Emit 'BACKEND_STATE=NOT_CONNECTED'
+    Emit 'BACKEND_REASON=no_telemetry_registration_on_production'
     if ($LocalState -eq 'SUCCEEDED') {
+        Emit 'OVERALL_STATE=PARTIAL'
         Emit 'PULSV=RUNNING'
         Emit 'SECZIO=RUNNING'
+    } else {
+        Emit 'OVERALL_STATE=FAILED'
+        Emit 'STATE=FAILED'
     }
 }
 function Invoke-LocalInstall([string]$Stage) {
@@ -437,8 +463,10 @@ function Invoke-LocalInstall([string]$Stage) {
     $ErrorActionPreference = 'Continue'
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Prepare
     $prepare = $LASTEXITCODE
+    $watchExit = -1
     if ($prepare -eq 0) {
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $continuity -Action Watch | Out-Null
+        $watchExit = $LASTEXITCODE
     }
     $ErrorActionPreference = 'Stop'
     if ($prepare -ne 0) {
@@ -451,8 +479,8 @@ function Invoke-LocalInstall([string]$Stage) {
     }
     $generation = Get-Sha256File (Join-Path $cache 'winrtcs.version')
     Emit ('GENERATION=' + $generation)
-    Publish-InstallSplit 'SUCCEEDED'
-    exit 4
+    Publish-InstallSplit 'SUCCEEDED' $keeperMap $watchExit
+    exit 0
 }
 
 if ($Continue) {
