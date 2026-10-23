@@ -7,6 +7,8 @@ param(
     [switch]$PostReboot,
     [switch]$HandoffProbe,
     [switch]$ProvenanceSelfTest,
+    [switch]$RebootPolicyCheck,
+    [string]$RebootPolicy = 'NEVER',
     [string]$StagePath = '',
     [string]$ExpectedSha256 = '',
     [string]$SourceUrl = '',
@@ -17,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
 [Net.ServicePointManager]::Expect100Continue = $false
 $SoftwareBase = 'https://raw.githubusercontent.com/Byteverait/winrtcs-physical-canary-delivery/main'
+$script:RebootPolicy = 'NEVER'
 $ExpectedBootstrap = '0a62d34817f218df4cdf17f48b6d56ac767131843614842360551c7ab58880b7'
 $script:CanaryLog = 'C:\ProgramData\WinRTCS\canary-install.log'
 $script:CanaryRoot = 'C:\ProgramData\WinRTCS'
@@ -178,8 +181,8 @@ function Write-RunProvenance([string]$Id, [hashtable]$Fields) {
     }
     foreach ($key in @($Fields.Keys)) { $current[[string]$key] = [string]$Fields[$key] }
     $names = @(
-        'run_id','stage','source_url','expected_sha256','foreground_path','foreground_sha256',
-        'worker_path','worker_sha256','generation_sha256'
+        'run_id','stage','source_url','expected_sha256','candidate_path','candidate_sha256',
+        'foreground_path','foreground_sha256','worker_path','worker_sha256','generation_sha256','reboot_policy'
     )
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($name in $names) {
@@ -194,7 +197,7 @@ function Write-RunProvenance([string]$Id, [hashtable]$Fields) {
     Remove-Item -LiteralPath $temp -Force
     & icacls.exe $path /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
     $stage = [string]$current['stage']
-    if ($stage -eq 'FOREGROUND_VERIFIED' -or $stage -eq 'WORKER_ARMED' -or $stage -eq 'GENERATION_COMMITTED') {
+    if ($stage -eq 'EXECUTED_FOREGROUND' -or $stage -eq 'REGISTERED_WORKER' -or $stage -eq 'RUNNING_WORKER' -or $stage -eq 'COMMITTED_GENERATION') {
         $pointer = Join-Path $script:CanaryRoot 'runs\current.txt'
         $pointerTemp = $pointer + '.tmp'
         $parent = Split-Path -Parent $pointer
@@ -270,17 +273,21 @@ function Confirm-LauncherIdentity {
     if ($ProvenanceSelfTest) {
         Write-RunProvenance $id @{
             run_id = $id
-            stage = 'FOREGROUND_VERIFIED'
+            stage = 'VERIFIED_CANDIDATE'
             source_url = [string]$SourceUrl
             expected_sha256 = $expected
-            foreground_path = $PSCommandPath
-            foreground_sha256 = $actual
+            candidate_path = $PSCommandPath
+            candidate_sha256 = $actual
+            foreground_path = ''
+            foreground_sha256 = ''
             worker_path = ''
             worker_sha256 = ''
             generation_sha256 = ''
+            reboot_policy = ''
         }
         Emit ('RUN_ID=' + $id)
-        Emit 'PROVENANCE_STAGE=FOREGROUND_VERIFIED'
+        Emit 'PROVENANCE_STAGE=VERIFIED_CANDIDATE'
+        Emit 'INSTALL_RUNTIME=NOT_ACTIVE'
         Emit 'KEEPER=NOT_CALLED'
         Emit 'REBOOT=NOT_CALLED'
         Emit 'TASK_CREATED=false'
@@ -367,7 +374,19 @@ function Register-CanaryReboot([string]$Enroll) {
     }
     if ($Enroll -and (Test-Path -LiteralPath $Enroll)) { Remove-Item -LiteralPath $Enroll -Force }
     Emit 'STATE=IN_PROGRESS'
+    Emit ('REBOOT_POLICY=' + $script:RebootPolicy)
     Emit 'REBOOT_REQUIRED=true'
+    if ($script:RebootPolicy -ne 'ON_REQUIRED') {
+        $await = Join-Path $script:CanaryRoot 'reboot-awaiting.txt'
+        [IO.File]::WriteAllText($await, ("REBOOT_POLICY=NEVER`r`nREBOOT_STATE=AWAITING_REBOOT`r`n"))
+        & icacls.exe $await /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+        Emit 'REBOOT_STATE=AWAITING_REBOOT'
+        Emit 'REBOOT=NOT_CALLED'
+        Emit 'SHUTDOWN=NOT_CALLED'
+        Emit 'OVERALL_STATE=PARTIAL'
+        Emit 'HEALTH=AWAITING_REBOOT'
+        exit 0
+    }
     & shutdown.exe /r /t 0 /f | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
@@ -556,7 +575,37 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 1
 }
 Confirm-LauncherIdentity
-if ($HandoffProbe) { Invoke-HandoffProbe }
+$script:RebootPolicy = ([string]$RebootPolicy).Trim().ToUpperInvariant()
+if ($script:RebootPolicy -ne 'NEVER' -and $script:RebootPolicy -ne 'ON_REQUIRED') {
+    Emit 'FAILURE_CODE=REBOOT_POLICY'
+    Emit 'REBOOT=NOT_CALLED'
+    Emit 'STATE=FAILED'
+    exit 3
+}
+Emit ('REBOOT_POLICY=' + $script:RebootPolicy)
+if ($RebootPolicyCheck) {
+    if ($script:RebootPolicy -ne 'NEVER') {
+        Emit 'FAILURE_CODE=REBOOT_POLICY'
+        Emit 'REBOOT=NOT_CALLED'
+        Emit 'SHUTDOWN=NOT_CALLED'
+        exit 3
+    }
+    Emit 'REBOOT_STATE=SUPPRESSED'
+    Emit 'REBOOT=NOT_CALLED'
+    Emit 'SHUTDOWN=NOT_CALLED'
+    Emit 'KEEPER=NOT_CALLED'
+    Emit 'TASK_CREATED=false'
+    Emit 'STATE=SUCCEEDED'
+    exit 0
+}
+if ($HandoffProbe) {
+    if ($script:RebootPolicy -ne 'NEVER') {
+        Emit 'FAILURE_CODE=REBOOT_POLICY'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    Invoke-HandoffProbe
+}
 Protect-CanaryLog
 Emit 'STATE=IN_PROGRESS'
 if ($PostReboot) {
@@ -730,6 +779,8 @@ function Invoke-LocalInstall([string]$Stage) {
         exit 4
     }
     $keeper = Join-Path $script:CanaryRoot 'winrtcs_keeper.ps1'
+    $env:WINRTCS_REBOOT_POLICY = $script:RebootPolicy
+    Emit ('KEEPER_REBOOT_POLICY=' + $script:RebootPolicy)
     $ErrorActionPreference = 'Continue'
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $keeper -Action Ensure
     $keeperCode = $LASTEXITCODE
@@ -791,9 +842,11 @@ function Invoke-LocalInstall([string]$Stage) {
     $generation = Get-Sha256File (Join-Path $cache 'winrtcs.version')
     Emit ('GENERATION=' + $generation)
     if ($handoffRun -match '^[0-9a-f]{32}$') {
-        Write-RunProvenance $handoffRun @{ run_id = $handoffRun; stage = 'GENERATION_COMMITTED'; generation_sha256 = $generation }
-        Emit 'PROVENANCE_STAGE=GENERATION_COMMITTED'
+        Write-RunProvenance $handoffRun @{ run_id = $handoffRun; stage = 'COMMITTED_GENERATION'; generation_sha256 = $generation; reboot_policy = $script:RebootPolicy }
+        Emit 'PROVENANCE_STAGE=COMMITTED_GENERATION'
+        Emit 'GENERATION_COMMITTED=true'
     }
+    Emit 'INSTALL_COMPLETED=true'
     Write-Handoff ('INSTALL_COMPLETED=true RUN_ID=' + $handoffRun)
     Publish-InstallSplit 'SUCCEEDED' $keeperMap $watchExit
     exit 0
@@ -908,7 +961,7 @@ if (-not $expectedWorker -or $actualWorker -ne $expectedWorker -or $PSCommandPat
     exit 3
 }
 [IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WORKER_ENTERED=true RUN_ID=__RUN__' + "`r`n"))
-& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -Continue -StagePath '__STAGE__' -RunId '__RUN__'
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -Continue -StagePath '__STAGE__' -RunId '__RUN__' -RebootPolicy '__POLICY__'
 $code = $LASTEXITCODE
 [IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WORKER_EXIT=' + $code + ' RUN_ID=__RUN__' + "`r`n"))
 [IO.File]::AppendAllText('C:\ProgramData\WinRTCS\canary-install.log', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WRAPPER_EXIT=' + $code + "`r`n"))
@@ -920,22 +973,24 @@ exit $code
     $handoffPath = Join-Path $script:CanaryRoot 'canary-handoff.txt'
     $quotedLauncher = $launcherCopy.Replace("'", "''")
     $quotedStage = $stage.Replace("'", "''")
-    $wrapperText = $wrapper.Replace('__LAUNCHER__', $quotedLauncher).Replace('__STAGE__', $quotedStage).Replace('__HANDOFF__', $handoffPath.Replace("'", "''")).Replace('__RUN__', $runId)
+    $wrapperText = $wrapper.Replace('__LAUNCHER__', $quotedLauncher).Replace('__STAGE__', $quotedStage).Replace('__HANDOFF__', $handoffPath.Replace("'", "''")).Replace('__RUN__', $runId).Replace('__POLICY__', $script:RebootPolicy)
     [IO.File]::WriteAllText($wrapperPath, $wrapperText)
     & icacls.exe $wrapperPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
     $workerHash = Get-Sha256File $wrapperPath
     $foregroundHash = Get-Sha256File $launcherCopy
     Write-RunProvenance $runId @{
         run_id = $runId
-        stage = 'WORKER_ARMED'
+        stage = 'EXECUTED_FOREGROUND'
         source_url = [string]$SourceUrl
         expected_sha256 = ([string]$ExpectedSha256).Trim().ToLowerInvariant()
         foreground_path = $launcherCopy
         foreground_sha256 = $foregroundHash
         worker_path = $wrapperPath
         worker_sha256 = $workerHash
+        reboot_policy = $script:RebootPolicy
     }
-    Emit 'PROVENANCE_STAGE=WORKER_ARMED'
+    Emit 'PROVENANCE_STAGE=EXECUTED_FOREGROUND'
+    Emit 'FOREGROUND_VERIFIED=true'
     Emit ('WORKER_SHA256=' + $workerHash)
     $runFile = Join-Path $script:CanaryRoot 'canary-run.id'
     [IO.File]::WriteAllText($runFile, $runId)
@@ -1000,6 +1055,9 @@ exit $code
     Emit ('TASK_WRAPPER=' + $wrapperPath)
     Emit ('STAGE_PATH=' + $stage)
     Emit 'TASK_IDENTITY=S-1-5-18'
+    Write-RunProvenance $runId @{ run_id = $runId; stage = 'REGISTERED_WORKER'; reboot_policy = $script:RebootPolicy }
+    Emit 'PROVENANCE_STAGE=REGISTERED_WORKER'
+    Emit 'WORKER_ARMED=true'
     Emit 'SCHTASKS_RUN=0'
     Emit 'FOREGROUND_RESULT=SCHEDULED_ONLY'
     $entered = $false
@@ -1010,6 +1068,9 @@ exit $code
     $afterTask = Get-CanaryTask 'WinRTCSCanaryInstall'
     Emit 'LOG=C:\ProgramData\WinRTCS\canary-install.log'
     if ($entered) {
+        Write-RunProvenance $runId @{ run_id = $runId; stage = 'RUNNING_WORKER'; reboot_policy = $script:RebootPolicy }
+        Emit 'PROVENANCE_STAGE=RUNNING_WORKER'
+        Emit 'WORKER_ENTERED=true'
         Emit 'HANDOFF=WORKER_ENTERED'
         Emit 'FOREGROUND_RESULT=WORKER_ENTERED'
         Emit 'STATE=IN_PROGRESS'
