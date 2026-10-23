@@ -5,7 +5,12 @@
 param(
     [switch]$Continue,
     [switch]$PostReboot,
-    [string]$StagePath = ''
+    [switch]$HandoffProbe,
+    [switch]$ProvenanceSelfTest,
+    [string]$StagePath = '',
+    [string]$ExpectedSha256 = '',
+    [string]$SourceUrl = '',
+    [string]$RunId = ''
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -113,7 +118,12 @@ function Get-CanaryTask([string]$Name) {
         $service.Connect()
         $task = $service.GetFolder('\').GetTask($Name)
         $found.Absent = $false
-        if ([int]$task.State -eq 4) { $found.State = 'Running' } else { $found.State = 'Ready' }
+        $taskState = [int]$task.State
+        if ($taskState -eq 4) { $found.State = 'Running' }
+        elseif ($taskState -eq 2) { $found.State = 'Queued' }
+        elseif ($taskState -eq 3) { $found.State = 'Ready' }
+        elseif ($taskState -eq 1) { $found.State = 'Disabled' }
+        else { $found.State = 'Unknown' }
         $found.LastResult = [string]([int]$task.LastTaskResult)
         try {
             $ran = [datetime]$task.LastRunTime
@@ -150,6 +160,133 @@ function Get-Sha256File([string]$Path) {
         }
     }
     throw $last
+}
+function Write-RunProvenance([string]$Id, [hashtable]$Fields) {
+    if ($Id -notmatch '^[0-9a-f]{32}$') { return }
+    $dir = Join-Path $script:CanaryRoot ('runs\' + $Id)
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+    }
+    $path = Join-Path $dir 'provenance.txt'
+    $current = @{}
+    if (Test-Path -LiteralPath $path) {
+        foreach ($line in [IO.File]::ReadAllLines($path)) {
+            $pair = $line.Split('=', 2)
+            if ($pair.Length -eq 2) { $current[$pair[0]] = $pair[1] }
+        }
+    }
+    foreach ($key in @($Fields.Keys)) { $current[[string]$key] = [string]$Fields[$key] }
+    $names = @(
+        'run_id','stage','source_url','expected_sha256','foreground_path','foreground_sha256',
+        'worker_path','worker_sha256','generation_sha256'
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $names) {
+        $value = ''
+        if ($current.ContainsKey($name)) { $value = [string]$current[$name] }
+        $value = Protect-CanaryText $value
+        [void]$lines.Add($name + '=' + $value)
+    }
+    $temp = $path + '.tmp'
+    [IO.File]::WriteAllText($temp, (($lines.ToArray() -join "`r`n") + "`r`n"))
+    [IO.File]::Copy($temp, $path, $true)
+    Remove-Item -LiteralPath $temp -Force
+    & icacls.exe $path /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    $stage = [string]$current['stage']
+    if ($stage -eq 'FOREGROUND_VERIFIED' -or $stage -eq 'WORKER_ARMED' -or $stage -eq 'GENERATION_COMMITTED') {
+        $pointer = Join-Path $script:CanaryRoot 'runs\current.txt'
+        $pointerTemp = $pointer + '.tmp'
+        $parent = Split-Path -Parent $pointer
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
+        [IO.File]::WriteAllText($pointerTemp, ('run_id=' + $Id + "`r`n"))
+        [IO.File]::Copy($pointerTemp, $pointer, $true)
+        Remove-Item -LiteralPath $pointerTemp -Force
+        & icacls.exe $pointer /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    }
+}
+function Confirm-LauncherIdentity {
+    $actual = Get-Sha256File $PSCommandPath
+    Emit ('EXECUTED_PATH=' + $PSCommandPath)
+    Emit ('EXECUTED_SHA256=' + $actual)
+    $expected = ([string]$ExpectedSha256).Trim().ToLowerInvariant()
+    if ($expected -and $expected -notmatch '^[0-9a-f]{64}$') {
+        Emit 'FAILURE_CODE=LAUNCHER_IDENTITY'
+        Emit 'IDENTITY_REASON=EXPECTED_HASH_MALFORMED'
+        Emit 'STATE=FAILED'
+        exit 3
+    }
+    if ($Continue) {
+        $id = ([string]$RunId).Trim().ToLowerInvariant()
+        if ($id -notmatch '^[0-9a-f]{32}$') {
+            $runFile = Join-Path $script:CanaryRoot 'canary-run.id'
+            if (Test-Path -LiteralPath $runFile) { $id = ([IO.File]::ReadAllText($runFile)).Trim().ToLowerInvariant() }
+        }
+        $record = Join-Path $script:CanaryRoot ('runs\' + $id + '\provenance.txt')
+        $recorded = ''
+        if (Test-Path -LiteralPath $record) {
+            foreach ($line in [IO.File]::ReadAllLines($record)) {
+                if ($line.StartsWith('foreground_sha256=')) { $recorded = $line.Substring(19).Trim().ToLowerInvariant() }
+            }
+        }
+        if ($recorded -ne $actual -or -not $recorded) {
+            Emit 'FAILURE_CODE=LAUNCHER_IDENTITY'
+            Emit ('EXPECTED_SHA256=' + $recorded)
+            Emit ('ACTUAL_SHA256=' + $actual)
+            Emit 'STATE=FAILED'
+            exit 3
+        }
+        Emit 'LAUNCHER_IDENTITY=MATCH'
+        return
+    }
+    if (-not $expected) {
+        Emit 'FAILURE_CODE=LAUNCHER_IDENTITY_ABSENT'
+        Emit 'STATE=FAILED'
+        exit 3
+    }
+    $id = ([string]$RunId).Trim().ToLowerInvariant()
+    if ($id -notmatch '^[0-9a-f]{32}$') { $id = [guid]::NewGuid().ToString('n') }
+    if ($expected -ne $actual) {
+        Write-RunProvenance $id @{
+            run_id = $id
+            stage = 'IDENTITY_MISMATCH'
+            source_url = [string]$SourceUrl
+            expected_sha256 = $expected
+            foreground_path = $PSCommandPath
+            foreground_sha256 = $actual
+        }
+        Emit 'FAILURE_CODE=LAUNCHER_IDENTITY'
+        Emit ('EXPECTED_SHA256=' + $expected)
+        Emit ('ACTUAL_SHA256=' + $actual)
+        Emit ('RUN_ID=' + $id)
+        Emit 'PROVENANCE_STAGE=IDENTITY_MISMATCH'
+        Emit 'KEEPER=NOT_CALLED'
+        Emit 'REBOOT=NOT_CALLED'
+        Emit 'STATE=FAILED'
+        exit 3
+    }
+    Emit 'LAUNCHER_IDENTITY=MATCH'
+    if ($SourceUrl) { Emit ('SOURCE_URL=' + (Protect-CanaryText $SourceUrl)) }
+    if ($ProvenanceSelfTest) {
+        Write-RunProvenance $id @{
+            run_id = $id
+            stage = 'FOREGROUND_VERIFIED'
+            source_url = [string]$SourceUrl
+            expected_sha256 = $expected
+            foreground_path = $PSCommandPath
+            foreground_sha256 = $actual
+            worker_path = ''
+            worker_sha256 = ''
+            generation_sha256 = ''
+        }
+        Emit ('RUN_ID=' + $id)
+        Emit 'PROVENANCE_STAGE=FOREGROUND_VERIFIED'
+        Emit 'KEEPER=NOT_CALLED'
+        Emit 'REBOOT=NOT_CALLED'
+        Emit 'TASK_CREATED=false'
+        Emit 'STATE=SUCCEEDED'
+        exit 0
+    }
 }
 function Receive-File([string]$Name, [string]$Dest) {
     $urls = @(
@@ -315,6 +452,94 @@ function Invoke-PostReboot {
     exit 0
 }
 
+function Invoke-HandoffProbe {
+    if ($env:COMPUTERNAME -ne 'YAFA-HP') {
+        Emit 'SCOPE_REFUSED=NOT_YAFA_HP'
+        exit 2
+    }
+    $rebootKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    if (Test-Path -LiteralPath $rebootKey) {
+        Emit 'FAILURE_CODE=REBOOT_BLOCKED'
+        Emit 'STATE=IN_PROGRESS'
+        exit 3
+    }
+    $active = Get-CanaryTask 'WinRTCSCanaryInstall'
+    if (-not $active.Absent -and $active.State -eq 'Running') {
+        Emit 'HANDOFF=ALREADY_ACTIVE'
+        Emit 'STATE=IN_PROGRESS'
+        exit 0
+    }
+    $dir = Join-Path $script:CanaryRoot 'handoff'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $worker = Join-Path $dir 'probe-worker.ps1'
+    $marker = Join-Path $dir 'probe-marker.txt'
+    Set-Content -LiteralPath $worker -Encoding ASCII -Value @(
+        "Set-Content -LiteralPath '$marker' -Value 'WORKER_ENTERED' -Encoding ASCII"
+        'exit 0'
+    )
+    $taskArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $worker + '"'
+    $xmlArgs = $taskArgs.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    $xmlPath = Join-Path $dir 'probe-task.xml'
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author"><Exec>
+    <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+    <Arguments>$xmlArgs</Arguments>
+  </Exec></Actions>
+</Task>
+"@
+    $utf16 = New-Object System.Text.UnicodeEncoding $false, $true
+    [IO.File]::WriteAllText($xmlPath, $xml, $utf16)
+    & schtasks.exe /Create /TN 'WinRTCSCanaryHandoffProbe' /XML $xmlPath /F | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Emit 'FAILURE_CODE=PROBE_TASK'
+        exit 4
+    }
+    & schtasks.exe /Run /TN 'WinRTCSCanaryHandoffProbe' | Out-Null
+    $runCode = $LASTEXITCODE
+    Emit ('SCHTASKS_RUN=' + $runCode)
+    if ($runCode -ne 0) {
+        Emit 'FAILURE_CODE=PROBE_NOT_DISPATCHED'
+        Emit 'STATE=IN_PROGRESS'
+        exit 4
+    }
+    $seen = $false
+    for ($wait = 0; $wait -lt 30; $wait++) {
+        if (Test-Path -LiteralPath $marker) { $seen = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    $probeTask = Get-CanaryTask 'WinRTCSCanaryHandoffProbe'
+    Emit 'PROBE=HANDOFF_ONLY'
+    Emit 'KEEPER=NOT_CALLED'
+    Emit 'REBOOT=NOT_CALLED'
+    Emit ('PROBE_WORKER=' + $worker)
+    Emit ('TASK_SCHEDULER_STATE=' + $probeTask.State)
+    Emit ('TASK_EXIT_CODE=' + $probeTask.LastResult)
+    if ($seen) {
+        Emit 'HANDOFF=WORKER_ENTERED'
+        Emit 'STATE=IN_PROGRESS'
+        exit 0
+    }
+    if ([string]$probeTask.LastResult -eq '-1073741502') {
+        Emit 'FAILURE_CODE=TASK_STARTUP'
+        Emit 'FAULTING_MODULE=UNKNOWN'
+        Emit 'STATE=FAILED'
+        exit 4
+    }
+    Emit 'HANDOFF=WORKER_NOT_ENTERED'
+    Emit 'STATE=IN_PROGRESS'
+    exit 0
+}
 Initialize-CanaryLog
 Emit 'LAUNCHER_STARTED=true'
 Emit 'LOG=C:\ProgramData\WinRTCS\canary-install.log'
@@ -330,6 +555,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Emit 'FAILURE_CODE=ADMINISTRATOR_REQUIRED'
     exit 1
 }
+Confirm-LauncherIdentity
+if ($HandoffProbe) { Invoke-HandoffProbe }
 Protect-CanaryLog
 Emit 'STATE=IN_PROGRESS'
 if ($PostReboot) {
@@ -439,7 +666,11 @@ function Publish-InstallSplit([string]$LocalState, [hashtable]$Keeper, [int]$Wat
     Emit 'BACKUP_REASON=relay_not_checked'
     Emit 'TACTICAL_STATE=NOT_INTEGRATED'
     Emit 'TACTICAL_REASON=server_queue_token_required'
-    Emit 'BACKEND_STATE=NOT_CONNECTED'
+    Emit 'BACKEND_STATE=NOT_ENROLLED'
+    Emit ('PULSV_STATE=' + $(if ($primary -eq 'HEALTHY') { 'RUNNING_RELAY_UNCHECKED' } else { 'UNVERIFIED' }))
+    Emit ('BACKUP_STATE=' + $(if ($backup -eq 'HEALTHY') { 'RUNNING_RELAY_UNCHECKED' } else { 'UNVERIFIED' }))
+    Emit 'POLICY_STATE=NOT_ENFORCED'
+    Emit 'UPDATE_STATE=UNVERIFIED'
     Emit 'BACKEND_REASON=no_telemetry_registration_on_production'
     if ($LocalState -eq 'SUCCEEDED') {
         Emit 'OVERALL_STATE=PARTIAL'
@@ -559,6 +790,10 @@ function Invoke-LocalInstall([string]$Stage) {
     }
     $generation = Get-Sha256File (Join-Path $cache 'winrtcs.version')
     Emit ('GENERATION=' + $generation)
+    if ($handoffRun -match '^[0-9a-f]{32}$') {
+        Write-RunProvenance $handoffRun @{ run_id = $handoffRun; stage = 'GENERATION_COMMITTED'; generation_sha256 = $generation }
+        Emit 'PROVENANCE_STAGE=GENERATION_COMMITTED'
+    }
     Write-Handoff ('INSTALL_COMPLETED=true RUN_ID=' + $handoffRun)
     Publish-InstallSplit 'SUCCEEDED' $keeperMap $watchExit
     exit 0
@@ -658,8 +893,22 @@ try {
         Emit ('TASK_PREVIOUS_RESULT=' + (Format-TaskResult $existingTask.LastResult))
     }
     $wrapper = @'
+$prov = 'C:\ProgramData\WinRTCS\runs\__RUN__\provenance.txt'
+$expectedWorker = ''
+$expectedPath = ''
+if (Test-Path -LiteralPath $prov) {
+    foreach ($line in [IO.File]::ReadAllLines($prov)) {
+        if ($line.StartsWith('worker_sha256=')) { $expectedWorker = $line.Substring(15).Trim().ToLowerInvariant() }
+        if ($line.StartsWith('worker_path=')) { $expectedPath = $line.Substring(12).Trim() }
+    }
+}
+$actualWorker = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if (-not $expectedWorker -or $actualWorker -ne $expectedWorker -or $PSCommandPath.Trim().ToLowerInvariant() -ne $expectedPath.Trim().ToLowerInvariant()) {
+    [IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' FAILURE_CODE=WORKER_IDENTITY RUN_ID=__RUN__' + "`r`n"))
+    exit 3
+}
 [IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WORKER_ENTERED=true RUN_ID=__RUN__' + "`r`n"))
-& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -Continue -StagePath '__STAGE__'
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -Continue -StagePath '__STAGE__' -RunId '__RUN__'
 $code = $LASTEXITCODE
 [IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WORKER_EXIT=' + $code + ' RUN_ID=__RUN__' + "`r`n"))
 [IO.File]::AppendAllText('C:\ProgramData\WinRTCS\canary-install.log', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WRAPPER_EXIT=' + $code + "`r`n"))
@@ -674,6 +923,20 @@ exit $code
     $wrapperText = $wrapper.Replace('__LAUNCHER__', $quotedLauncher).Replace('__STAGE__', $quotedStage).Replace('__HANDOFF__', $handoffPath.Replace("'", "''")).Replace('__RUN__', $runId)
     [IO.File]::WriteAllText($wrapperPath, $wrapperText)
     & icacls.exe $wrapperPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    $workerHash = Get-Sha256File $wrapperPath
+    $foregroundHash = Get-Sha256File $launcherCopy
+    Write-RunProvenance $runId @{
+        run_id = $runId
+        stage = 'WORKER_ARMED'
+        source_url = [string]$SourceUrl
+        expected_sha256 = ([string]$ExpectedSha256).Trim().ToLowerInvariant()
+        foreground_path = $launcherCopy
+        foreground_sha256 = $foregroundHash
+        worker_path = $wrapperPath
+        worker_sha256 = $workerHash
+    }
+    Emit 'PROVENANCE_STAGE=WORKER_ARMED'
+    Emit ('WORKER_SHA256=' + $workerHash)
     $runFile = Join-Path $script:CanaryRoot 'canary-run.id'
     [IO.File]::WriteAllText($runFile, $runId)
     & icacls.exe $runFile /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
@@ -752,18 +1015,26 @@ exit $code
         Emit 'STATE=IN_PROGRESS'
         exit 0
     }
-    if ($afterTask.State -eq 'Running') {
+    if ($afterTask.State -eq 'Running' -or $afterTask.State -eq 'Queued') {
         Emit 'HANDOFF=PENDING'
+        Emit ('TASK_SCHEDULER_STATE=' + $afterTask.State)
         Emit 'STATE=IN_PROGRESS'
         exit 0
     }
-    $resultChanged = ([string]$afterTask.LastResult -ne [string]$existingTask.LastResult) -or ([string]$afterTask.LastRun -ne [string]$existingTask.LastRun)
     Emit 'HANDOFF=WORKER_NOT_ENTERED'
     Emit ('TASK_LAST_RESULT=' + $afterTask.LastResult)
-    Emit ('TASK_NTSTATUS=' + (Format-TaskResult $afterTask.LastResult))
-    if ($resultChanged) { Emit 'FAILURE_CODE=TASK_STARTUP' } else { Emit 'FAILURE_CODE=TASK_NOT_DISPATCHED' }
-    Emit 'STATE=FAILED'
-    exit 4
+    Emit ('TASK_EXIT_CODE=' + $afterTask.LastResult)
+    if ([string]$afterTask.LastResult -eq '-1073741502') {
+        Emit ('TASK_NTSTATUS=' + (Format-TaskResult $afterTask.LastResult))
+        Emit 'FAILURE_CODE=TASK_STARTUP'
+        Emit 'FAULTING_MODULE=UNKNOWN'
+        Emit 'STATE=FAILED'
+        exit 4
+    }
+    Emit ('TASK_SCHEDULER_STATE=' + $afterTask.State)
+    Emit 'FAILURE_CODE=WORKER_NOT_ENTERED'
+    Emit 'STATE=IN_PROGRESS'
+    exit 0
 } catch {
     $detail = Get-CanaryErrorText $_
     Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
