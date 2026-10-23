@@ -8,6 +8,7 @@ param(
     [switch]$HandoffProbe,
     [switch]$ProvenanceSelfTest,
     [switch]$ProvenanceParserCheck,
+    [switch]$DeliveryPinCheck,
     [switch]$ConfirmWorkerIdentity,
     [switch]$RebootPolicyCheck,
     [string]$RebootPolicy = 'NEVER',
@@ -21,7 +22,8 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::CheckCertificateRevocationList = $true
 [Net.ServicePointManager]::Expect100Continue = $false
-$SoftwareBase = 'https://raw.githubusercontent.com/Byteverait/winrtcs-physical-canary-delivery/main'
+$ComponentCommit = '6ad8a6dcbfa2f18bf935bc41a86846bd3992d10f'
+$SoftwareBase = 'https://raw.githubusercontent.com/Byteverait/winrtcs-physical-canary-delivery/' + $ComponentCommit
 $script:RebootPolicy = 'NEVER'
 $ExpectedBootstrap = '0a62d34817f218df4cdf17f48b6d56ac767131843614842360551c7ab58880b7'
 $script:CanaryLog = 'C:\ProgramData\WinRTCS\canary-install.log'
@@ -418,30 +420,93 @@ function Confirm-LauncherIdentity {
     }
 }
 function Receive-File([string]$Name, [string]$Dest) {
-    $urls = @(
-        ($SoftwareBase + '/' + $Name),
-        ('https://github.com/Byteverait/winrtcs-physical-canary-delivery/raw/main/' + $Name)
-    )
-    foreach ($url in $urls) {
-        for ($try = 1; $try -le 3; $try++) {
-            $client = $null
-            try {
-                if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Force }
-                $client = New-Object Net.WebClient
-                $client.Headers['User-Agent'] = 'winrtcs-canary-delivery'
-                $client.DownloadFile($url, $Dest)
-                if ((Test-Path -LiteralPath $Dest) -and ((Get-Item -LiteralPath $Dest).Length -gt 0)) { return }
-            } catch {
-                if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
-            } finally {
-                if ($null -ne $client) { $client.Dispose() }
-            }
+    $url = $SoftwareBase + '/' + $Name
+    $lastError = 'EMPTY'
+    for ($try = 1; $try -le 3; $try++) {
+        $client = $null
+        try {
+            if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Force }
+            $client = New-Object Net.WebClient
+            $client.Headers['User-Agent'] = 'winrtcs-canary-delivery'
+            $client.DownloadFile($url, $Dest)
+            if ((Test-Path -LiteralPath $Dest) -and ((Get-Item -LiteralPath $Dest).Length -gt 0)) { return }
+            $lastError = 'EMPTY'
+        } catch {
+            $lastError = $_.Exception.GetType().Name
+            if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+        } finally {
+            if ($null -ne $client) { $client.Dispose() }
         }
     }
     Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
     Emit 'STATE=FAILED'
     Emit 'FAILURE_CODE=DOWNLOAD'
+    Emit ('DOWNLOAD_NAME=' + $Name)
+    Emit ('DOWNLOAD_URL=' + $url)
+    Emit ('DOWNLOAD_ERROR=' + $lastError)
     exit 3
+}
+function Invoke-DeliveryPinCheck {
+    $dir = Join-Path $script:CanaryRoot 'pin-check'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try {
+        Emit ('COMPONENT_COMMIT=' + $ComponentCommit)
+        Emit ('COMPONENT_BASE=' + $SoftwareBase)
+        $bootstrap = Join-Path $dir 'winrtcs_zero_state_bootstrap.ps1'
+        $version = Join-Path $dir 'winrtcs.version'
+        $signature = Join-Path $dir 'winrtcs.version.sig'
+        $watchdog = Join-Path $dir 'winrtcs_watchdog.cmd'
+        Receive-File 'winrtcs_zero_state_bootstrap.ps1' $bootstrap
+        if ((Get-Sha256File $bootstrap) -ne $ExpectedBootstrap) {
+            Emit 'FAILURE_CODE=BOOTSTRAP_HASH'
+            exit 3
+        }
+        Receive-File 'winrtcs.version' $version
+        Receive-File 'winrtcs.version.sig' $signature
+        $mod = [regex]::Match([IO.File]::ReadAllText($bootstrap), "GenerationModulus = '([^']+)'").Groups[1].Value
+        $sigB64 = [regex]::Match([IO.File]::ReadAllText($signature), '(?m)^sig=([A-Za-z0-9+/=]+)\s*$').Groups[1].Value
+        $publisher = New-Object Security.Cryptography.RSACryptoServiceProvider
+        $params = New-Object Security.Cryptography.RSAParameters
+        $params.Modulus = [Convert]::FromBase64String($mod)
+        $params.Exponent = [Convert]::FromBase64String('AQAB')
+        $publisher.ImportParameters($params)
+        $versionBytes = [IO.File]::ReadAllBytes($version)
+        if (-not $sigB64 -or -not $publisher.VerifyData($versionBytes, 'SHA256', [Convert]::FromBase64String($sigB64))) {
+            Emit 'FAILURE_CODE=BAD_SIGNATURE'
+            exit 3
+        }
+        $pins = @{}
+        foreach ($line in [IO.File]::ReadAllLines($version)) {
+            $pair = $line.Split('=', 2)
+            if ($pair.Length -eq 2) { $pins[$pair[0].Trim()] = $pair[1].Trim() }
+        }
+        Emit ('GENERATION_SHA256=' + (Get-Sha256File $version))
+        Emit ('CONTINUITY_SHA256=' + [string]$pins['CONTINUITY_SHA256'])
+        Emit ('WATCHDOG_SHA256=' + [string]$pins['WATCHDOG_SHA256'])
+        Emit ('WDGATE_SHA256=' + [string]$pins['LAUNCHER_SHA256'])
+        Emit 'TRUST_FIELD=LAUNCHER_SHA256_MEANS_WDGATE'
+        Emit 'PS1_LAUNCHER_TRUST=GIST_PIN_SAME_PUBLISHER'
+        Emit 'COMPONENT_TRUST=MANIFEST_SIGNATURE'
+        Receive-File 'winrtcs_watchdog.cmd' $watchdog
+        $expect = ''
+        foreach ($line in [IO.File]::ReadAllLines($watchdog)) {
+            if ($line.StartsWith('set "EXPECT=')) { $expect = $line.Substring(12).Trim().TrimEnd('"').ToLowerInvariant() }
+        }
+        Emit ('WATCHDOG_EXPECT=' + $expect)
+        if ($expect -and $expect -eq ([string]$pins['CONTINUITY_SHA256']).ToLowerInvariant()) {
+            Emit 'WATCHDOG_PAIR=MATCH'
+        } else {
+            Emit 'WATCHDOG_PAIR=MISMATCH'
+        }
+        Emit 'KEEPER=NOT_CALLED'
+        Emit 'REBOOT=NOT_CALLED'
+        Emit 'SHUTDOWN=NOT_CALLED'
+        Emit 'TASK_CREATED=false'
+        Emit 'INSTALL_RUNTIME=NOT_ACTIVE'
+    } finally {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit 0
 }
 function Test-ServiceRunning([string]$Name) {
     $preference = $ErrorActionPreference
@@ -728,6 +793,14 @@ if ($RebootPolicyCheck) {
     Emit 'TASK_CREATED=false'
     Emit 'STATE=SUCCEEDED'
     exit 0
+}
+if ($DeliveryPinCheck) {
+    if ($script:RebootPolicy -ne 'NEVER') {
+        Emit 'FAILURE_CODE=REBOOT_POLICY'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    Invoke-DeliveryPinCheck
 }
 if ($ProvenanceParserCheck) {
     if ($script:RebootPolicy -ne 'NEVER') {
@@ -1041,6 +1114,8 @@ try {
         $pair = $line.Split('=', 2)
         if ($pair.Length -eq 2) { $pins[$pair[0].Trim()] = $pair[1].Trim() }
     }
+    Emit ('WDGATE_SHA256=' + [string]$pins['LAUNCHER_SHA256'])
+    Emit 'TRUST_FIELD=LAUNCHER_SHA256_MEANS_WDGATE'
     $map = @{
         'winrtcs_agent.cmd' = 'AGENT_SHA256'
         'winrtcs_guard.cmd' = 'GUARD_SHA256'
