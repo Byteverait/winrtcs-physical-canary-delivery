@@ -229,7 +229,8 @@ function Confirm-LauncherIdentity {
         $recorded = ''
         if (Test-Path -LiteralPath $record) {
             foreach ($line in [IO.File]::ReadAllLines($record)) {
-                if ($line.StartsWith('foreground_sha256=')) { $recorded = $line.Substring(19).Trim().ToLowerInvariant() }
+                $pair = $line.Split('=', 2)
+                if ($pair.Length -eq 2 -and $pair[0] -eq 'foreground_sha256') { $recorded = $pair[1].Trim().ToLowerInvariant() }
             }
         }
         if ($recorded -ne $actual -or -not $recorded) {
@@ -951,8 +952,10 @@ $expectedWorker = ''
 $expectedPath = ''
 if (Test-Path -LiteralPath $prov) {
     foreach ($line in [IO.File]::ReadAllLines($prov)) {
-        if ($line.StartsWith('worker_sha256=')) { $expectedWorker = $line.Substring(15).Trim().ToLowerInvariant() }
-        if ($line.StartsWith('worker_path=')) { $expectedPath = $line.Substring(12).Trim() }
+        $pair = $line.Split('=', 2)
+        if ($pair.Length -ne 2) { continue }
+        if ($pair[0] -eq 'worker_sha256') { $expectedWorker = $pair[1].Trim().ToLowerInvariant() }
+        if ($pair[0] -eq 'worker_path') { $expectedPath = $pair[1].Trim() }
     }
 }
 $actualWorker = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
