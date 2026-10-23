@@ -81,14 +81,14 @@ function Protect-CanaryLog {
 function Get-CanaryTask([string]$Name) {
     $found = [pscustomobject]@{ Absent = $true; State = '' }
     try {
-        $task = Get-ScheduledTask -TaskName $Name -ErrorAction Stop
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $task = $service.GetFolder('\').GetTask($Name)
         $found.Absent = $false
-        $found.State = [string]$task.State
+        if ([int]$task.State -eq 4) { $found.State = 'Running' } else { $found.State = 'Ready' }
     } catch {
-        $id = [string]$_.FullyQualifiedErrorId
-        $msg = [string]$_.Exception.Message
-        $absent = $id.StartsWith('CmdletizationQuery_NotFound') -or $msg.Contains('No MSFT_ScheduledTask objects found')
-        if (-not $absent) { throw }
+        $found.Absent = $true
+        $found.State = ''
     }
     return $found
 }
@@ -113,12 +113,24 @@ function Get-Sha256File([string]$Path) {
     throw $last
 }
 function Receive-File([string]$Name, [string]$Dest) {
-    for ($try = 1; $try -le 3; $try++) {
-        try {
-            Invoke-WebRequest -Uri ($SoftwareBase + '/' + $Name) -OutFile $Dest -UseBasicParsing
-            return
-        } catch {
-            if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+    $urls = @(
+        ($SoftwareBase + '/' + $Name),
+        ('https://github.com/Byteverait/winrtcs-physical-canary-delivery/raw/main/' + $Name)
+    )
+    foreach ($url in $urls) {
+        for ($try = 1; $try -le 3; $try++) {
+            $client = $null
+            try {
+                if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Force }
+                $client = New-Object Net.WebClient
+                $client.Headers['User-Agent'] = 'winrtcs-canary-delivery'
+                $client.DownloadFile($url, $Dest)
+                if ((Test-Path -LiteralPath $Dest) -and ((Get-Item -LiteralPath $Dest).Length -gt 0)) { return }
+            } catch {
+                if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+            } finally {
+                if ($null -ne $client) { $client.Dispose() }
+            }
         }
     }
     Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
