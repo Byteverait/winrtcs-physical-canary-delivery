@@ -7,9 +7,12 @@ param(
     [switch]$PostReboot,
     [switch]$HandoffProbe,
     [switch]$ProvenanceSelfTest,
+    [switch]$ProvenanceParserCheck,
+    [switch]$ConfirmWorkerIdentity,
     [switch]$RebootPolicyCheck,
     [string]$RebootPolicy = 'NEVER',
     [string]$StagePath = '',
+    [string]$WorkerPath = '',
     [string]$ExpectedSha256 = '',
     [string]$SourceUrl = '',
     [string]$RunId = ''
@@ -164,6 +167,117 @@ function Get-Sha256File([string]$Path) {
     }
     throw $last
 }
+function Read-ProvenanceRecord([string]$Text, [string]$ExpectedRunId) {
+    $fields = @{}
+    if ([string]::IsNullOrEmpty($Text)) {
+        return [pscustomobject]@{ ok = $false; reason = 'MISSING'; fields = $fields }
+    }
+    $normalized = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $allowed = @(
+        'run_id','stage','source_url','expected_sha256','candidate_path','candidate_sha256',
+        'foreground_path','foreground_sha256','worker_path','worker_sha256','generation_sha256','reboot_policy'
+    )
+    foreach ($raw in $normalized.Split("`n")) {
+        $line = $raw.Trim()
+        if (-not $line) { continue }
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { return [pscustomobject]@{ ok = $false; reason = 'MALFORMED'; fields = @{} } }
+        $key = $line.Substring(0, $eq).Trim()
+        $value = $line.Substring($eq + 1).Trim()
+        if ($allowed -notcontains $key) { return [pscustomobject]@{ ok = $false; reason = 'UNKNOWN_FIELD'; fields = @{} } }
+        if ($fields.ContainsKey($key)) { return [pscustomobject]@{ ok = $false; reason = 'DUPLICATE'; fields = @{} } }
+        $fields[$key] = $value
+    }
+    $run = [string]$fields['run_id']
+    if ($run -notmatch '^[0-9a-f]{32}$') { return [pscustomobject]@{ ok = $false; reason = 'RUN_ID'; fields = @{} } }
+    $expected = ([string]$ExpectedRunId).Trim().ToLowerInvariant()
+    if ($expected -and $run -ne $expected) { return [pscustomobject]@{ ok = $false; reason = 'RUN_BINDING'; fields = @{} } }
+    foreach ($name in @('expected_sha256','candidate_sha256','foreground_sha256','worker_sha256','generation_sha256')) {
+        if (-not $fields.ContainsKey($name)) { continue }
+        $digest = [string]$fields[$name]
+        if ($digest -and $digest -notmatch '^[0-9a-f]{64}$') { return [pscustomobject]@{ ok = $false; reason = 'HASH_MALFORMED'; fields = @{} } }
+    }
+    $policy = [string]$fields['reboot_policy']
+    if ($policy -and $policy -ne 'NEVER' -and $policy -ne 'ON_REQUIRED') {
+        return [pscustomobject]@{ ok = $false; reason = 'REBOOT_POLICY'; fields = @{} }
+    }
+    return [pscustomobject]@{ ok = $true; reason = 'OK'; fields = $fields }
+}
+function Write-ParserCase([string]$Name, [bool]$Pass, [ref]$Failed) {
+    if (-not $Pass) { $Failed.Value += 1 }
+    Emit ('PARSER_CASE=' + $Name + ' RESULT=' + $(if ($Pass) { 'PASS' } else { 'FAIL' }))
+}
+function Invoke-ProvenanceParserCheck {
+    $failed = 0
+    $full = 'a' + ('b' * 63)
+    $run = '1' * 32
+    $line = 'worker_sha256=' + $full
+    $legacy = $line.Substring(15).Trim().ToLowerInvariant()
+    $parsed = Read-ProvenanceRecord ("run_id=$run`r`n$line`r`n") $run
+    $dropped = ($legacy.Length -eq 63) -and ($legacy -eq $full.Substring(1)) -and ($legacy -ne $full) -and $parsed.ok -and ([string]$parsed.fields['worker_sha256'] -eq $full)
+    Write-ParserCase 'DROPPED_FIRST_CHARACTER' $dropped ([ref]$failed)
+    $valid = Read-ProvenanceRecord ("run_id=$run`nworker_sha256=$full`n") $run
+    Write-ParserCase 'VALID_FULL_HASH' ($valid.ok -and [string]$valid.fields['worker_sha256'] -eq $full) ([ref]$failed)
+    $short = Read-ProvenanceRecord ("run_id=$run`nworker_sha256=abc`n") ''
+    Write-ParserCase 'HASH_MALFORMED' ((-not $short.ok) -and $short.reason -eq 'HASH_MALFORMED') ([ref]$failed)
+    $missing = Read-ProvenanceRecord '' ''
+    Write-ParserCase 'MISSING' ((-not $missing.ok) -and $missing.reason -eq 'MISSING') ([ref]$failed)
+    $duplicate = Read-ProvenanceRecord ("run_id=$run`nworker_sha256=$full`nworker_sha256=$full`n") ''
+    Write-ParserCase 'DUPLICATE' ((-not $duplicate.ok) -and $duplicate.reason -eq 'DUPLICATE') ([ref]$failed)
+    $wrong = Read-ProvenanceRecord ("run_id=$run`nworker_sha256=$full`n") $run
+    Write-ParserCase 'WRONG_HASH' ($wrong.ok -and [string]$wrong.fields['worker_sha256'] -ne ('c' * 64)) ([ref]$failed)
+    $spaced = Read-ProvenanceRecord (" run_id = $run `r`n worker_sha256 = $full `n") $run
+    Write-ParserCase 'WHITESPACE_AND_LINE_ENDINGS' ($spaced.ok -and [string]$spaced.fields['worker_sha256'] -eq $full) ([ref]$failed)
+    $other = '2' * 32
+    $bound = Read-ProvenanceRecord ("run_id=$run`nworker_sha256=$full`n") $other
+    Write-ParserCase 'RUN_BINDING' ((-not $bound.ok) -and $bound.reason -eq 'RUN_BINDING') ([ref]$failed)
+    Emit ('PARSER_RESULT=' + $(if ($failed -eq 0) { 'PASS' } else { 'FAIL' }))
+    Emit 'KEEPER=NOT_CALLED'
+    Emit 'REBOOT=NOT_CALLED'
+    Emit 'SHUTDOWN=NOT_CALLED'
+    Emit 'TASK_CREATED=false'
+    if ($failed -ne 0) { exit 3 }
+    exit 0
+}
+function Invoke-ConfirmWorkerIdentity {
+    $id = ([string]$RunId).Trim().ToLowerInvariant()
+    $recordPath = Join-Path $script:CanaryRoot ('runs\' + $id + '\provenance.txt')
+    if ($id -notmatch '^[0-9a-f]{32}$' -or -not (Test-Path -LiteralPath $recordPath)) {
+        Emit 'FAILURE_CODE=WORKER_IDENTITY'
+        Emit 'IDENTITY_REASON=MISSING'
+        Emit 'KEEPER=NOT_CALLED'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    $parsed = Read-ProvenanceRecord ([IO.File]::ReadAllText($recordPath)) $id
+    if (-not $parsed.ok) {
+        Emit 'FAILURE_CODE=WORKER_IDENTITY'
+        Emit ('IDENTITY_REASON=' + $parsed.reason)
+        Emit 'KEEPER=NOT_CALLED'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    $worker = ([string]$WorkerPath).Trim()
+    $expectedWorker = [string]$parsed.fields['worker_sha256']
+    $expectedPath = [string]$parsed.fields['worker_path']
+    $actualWorker = ''
+    if ($worker -and (Test-Path -LiteralPath $worker)) { $actualWorker = Get-Sha256File $worker }
+    $launcherHash = Get-Sha256File $PSCommandPath
+    $foreground = [string]$parsed.fields['foreground_sha256']
+    $policy = [string]$parsed.fields['reboot_policy']
+    $pathOk = $worker -and $expectedPath -and ($worker.ToLowerInvariant() -eq $expectedPath.ToLowerInvariant())
+    if (-not $expectedWorker -or $actualWorker -ne $expectedWorker -or -not $pathOk -or -not $foreground -or $launcherHash -ne $foreground -or $policy -ne $script:RebootPolicy) {
+        Emit 'FAILURE_CODE=WORKER_IDENTITY'
+        Emit 'IDENTITY_REASON=MISMATCH'
+        Emit 'KEEPER=NOT_CALLED'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    Emit 'WORKER_IDENTITY=MATCH'
+    Emit 'KEEPER=NOT_CALLED'
+    Emit 'REBOOT=NOT_CALLED'
+    exit 0
+}
 function Write-RunProvenance([string]$Id, [hashtable]$Fields) {
     if ($Id -notmatch '^[0-9a-f]{32}$') { return }
     $dir = Join-Path $script:CanaryRoot ('runs\' + $Id)
@@ -174,10 +288,13 @@ function Write-RunProvenance([string]$Id, [hashtable]$Fields) {
     $path = Join-Path $dir 'provenance.txt'
     $current = @{}
     if (Test-Path -LiteralPath $path) {
-        foreach ($line in [IO.File]::ReadAllLines($path)) {
-            $pair = $line.Split('=', 2)
-            if ($pair.Length -eq 2) { $current[$pair[0]] = $pair[1] }
+        $existing = Read-ProvenanceRecord ([IO.File]::ReadAllText($path)) ''
+        if (-not $existing.ok) {
+            Emit 'FAILURE_CODE=WORKER_IDENTITY'
+            Emit ('IDENTITY_REASON=' + $existing.reason)
+            exit 3
         }
+        foreach ($key in @($existing.fields.Keys)) { $current[[string]$key] = [string]$existing.fields[$key] }
     }
     foreach ($key in @($Fields.Keys)) { $current[[string]$key] = [string]$Fields[$key] }
     $names = @(
@@ -228,10 +345,14 @@ function Confirm-LauncherIdentity {
         $record = Join-Path $script:CanaryRoot ('runs\' + $id + '\provenance.txt')
         $recorded = ''
         if (Test-Path -LiteralPath $record) {
-            foreach ($line in [IO.File]::ReadAllLines($record)) {
-                $pair = $line.Split('=', 2)
-                if ($pair.Length -eq 2 -and $pair[0] -eq 'foreground_sha256') { $recorded = $pair[1].Trim().ToLowerInvariant() }
+            $parsed = Read-ProvenanceRecord ([IO.File]::ReadAllText($record)) $id
+            if (-not $parsed.ok) {
+                Emit 'FAILURE_CODE=LAUNCHER_IDENTITY'
+                Emit ('IDENTITY_REASON=' + $parsed.reason)
+                Emit 'STATE=FAILED'
+                exit 3
             }
+            $recorded = [string]$parsed.fields['foreground_sha256']
         }
         if ($recorded -ne $actual -or -not $recorded) {
             Emit 'FAILURE_CODE=LAUNCHER_IDENTITY'
@@ -575,6 +696,15 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Emit 'FAILURE_CODE=ADMINISTRATOR_REQUIRED'
     exit 1
 }
+$script:RebootPolicy = ([string]$RebootPolicy).Trim().ToUpperInvariant()
+if ($ConfirmWorkerIdentity) {
+    if ($script:RebootPolicy -ne 'NEVER' -and $script:RebootPolicy -ne 'ON_REQUIRED') {
+        Emit 'FAILURE_CODE=REBOOT_POLICY'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    Invoke-ConfirmWorkerIdentity
+}
 Confirm-LauncherIdentity
 $script:RebootPolicy = ([string]$RebootPolicy).Trim().ToUpperInvariant()
 if ($script:RebootPolicy -ne 'NEVER' -and $script:RebootPolicy -ne 'ON_REQUIRED') {
@@ -598,6 +728,14 @@ if ($RebootPolicyCheck) {
     Emit 'TASK_CREATED=false'
     Emit 'STATE=SUCCEEDED'
     exit 0
+}
+if ($ProvenanceParserCheck) {
+    if ($script:RebootPolicy -ne 'NEVER') {
+        Emit 'FAILURE_CODE=REBOOT_POLICY'
+        Emit 'REBOOT=NOT_CALLED'
+        exit 3
+    }
+    Invoke-ProvenanceParserCheck
 }
 if ($HandoffProbe) {
     if ($script:RebootPolicy -ne 'NEVER') {
@@ -947,19 +1085,8 @@ try {
         Emit ('TASK_PREVIOUS_RESULT=' + (Format-TaskResult $existingTask.LastResult))
     }
     $wrapper = @'
-$prov = 'C:\ProgramData\WinRTCS\runs\__RUN__\provenance.txt'
-$expectedWorker = ''
-$expectedPath = ''
-if (Test-Path -LiteralPath $prov) {
-    foreach ($line in [IO.File]::ReadAllLines($prov)) {
-        $pair = $line.Split('=', 2)
-        if ($pair.Length -ne 2) { continue }
-        if ($pair[0] -eq 'worker_sha256') { $expectedWorker = $pair[1].Trim().ToLowerInvariant() }
-        if ($pair[0] -eq 'worker_path') { $expectedPath = $pair[1].Trim() }
-    }
-}
-$actualWorker = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
-if (-not $expectedWorker -or $actualWorker -ne $expectedWorker -or $PSCommandPath.Trim().ToLowerInvariant() -ne $expectedPath.Trim().ToLowerInvariant()) {
+& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -ConfirmWorkerIdentity -RunId '__RUN__' -WorkerPath $PSCommandPath -RebootPolicy '__POLICY__'
+if ($LASTEXITCODE -ne 0) {
     [IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' FAILURE_CODE=WORKER_IDENTITY RUN_ID=__RUN__' + "`r`n"))
     exit 3
 }
