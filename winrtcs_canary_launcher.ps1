@@ -344,7 +344,38 @@ function Write-LocalDeviceKey {
     } finally { $rsa.Dispose() }
     & icacls.exe $keyPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
 }
+function Publish-ScreenConnectPolicy {
+    Emit 'SCREENCONNECT_POLICY=NOT_ENFORCED'
+    Emit 'SCREENCONNECT_PROHIBITED_LIST=EMPTY'
+    Emit 'SCREENCONNECT_ACTION=NONE'
+    Emit 'SCREENCONNECT_ACTION_REASON=explicit_prohibited_ids_not_configured'
+    Emit 'SCREENCONNECT_SHARED_PRODUCTCODE_UNINSTALL=REFUSED'
+    Emit 'SCREENCONNECT_COMPLIANCE=NOT_CLAIMED'
+    $approved = @{
+        '41b1cb0dd5f78b27' = 'APPROVED_PRIMARY'
+        '1432e226cdbd6e78' = 'APPROVED_BACKUP'
+    }
+    $found = 0
+    $preference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $services = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ScreenConnect*' })
+    $ErrorActionPreference = $preference
+    foreach ($svc in $services) {
+        $found += 1
+        $name = [string]$svc.Name
+        $id = 'UNPARSED'
+        $class = 'UNKNOWN_NO_ACTION'
+        if ($name -match '^ScreenConnect Client \(([0-9a-fA-F]{16})\)$') {
+            $id = $Matches[1].ToLowerInvariant()
+            if ($approved.ContainsKey($id)) { $class = [string]$approved[$id] }
+            elseif ($id -eq '36e506ff016b2151') { $class = 'UNTRUSTED_AUTO_REMOVAL_DISABLED' }
+        }
+        Emit ('SCREENCONNECT_INSTANCE=' + $name + ' ID=' + $id + ' CLASS=' + $class + ' SERVICE_STATE=' + [string]$svc.Status)
+    }
+    if ($found -eq 0) { Emit 'SCREENCONNECT_DETECTED=NONE' }
+}
 function Publish-InstallSplit([string]$LocalState, [hashtable]$Keeper, [int]$WatchExit) {
+    Publish-ScreenConnectPolicy
     if ($LocalState -eq 'SUCCEEDED') { Write-LocalDeviceKey }
     $continuityStatus = Join-Path $script:CanaryRoot 'continuity-status.txt'
     $watchdog = 'ABSENT'
@@ -492,7 +523,7 @@ if ($Continue) {
     Invoke-LocalInstall $StagePath
 }
 
-$stage = Join-Path $env:TEMP ('winrtcs-canary-' + [guid]::NewGuid().ToString('n'))
+$stage = Join-Path $script:CanaryRoot ('winrtcs-canary-' + [guid]::NewGuid().ToString('n'))
 $cleanup = $true
 try {
     New-Item -ItemType Directory -Path $stage | Out-Null
@@ -565,8 +596,9 @@ exit $code
 '@
     $quotedLauncher = $PSCommandPath.Replace("'", "''")
     $quotedStage = $stage.Replace("'", "''")
-    $wrapperPath = Join-Path $env:TEMP 'winrtcs_canary_unattended.ps1'
+    $wrapperPath = Join-Path $script:CanaryRoot 'winrtcs_canary_unattended.ps1'
     [IO.File]::WriteAllText($wrapperPath, $wrapper.Replace('__LAUNCHER__', $quotedLauncher).Replace('__STAGE__', $quotedStage))
+    & icacls.exe $wrapperPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
     $taskArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $wrapperPath + '"'
     $xmlArgs = $taskArgs.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
     $xmlPath = Join-Path $env:TEMP 'winrtcs-canary-unattended.xml'
@@ -601,6 +633,15 @@ exit $code
 "@
     $utf16 = New-Object System.Text.UnicodeEncoding $false, $true
     [IO.File]::WriteAllText($xmlPath, $xml, $utf16)
+    $existingTask = Get-CanaryTask 'WinRTCSCanaryInstall'
+    if (-not $existingTask.Absent -and $existingTask.State -eq 'Running') {
+        Emit ('RUN_ID=' + $runId)
+        Emit 'TASK_STATE=RUNNING'
+        Emit 'TASK_NAME=WinRTCSCanaryInstall'
+        Emit 'FOREGROUND_RESULT=SCHEDULED_ONLY'
+        Emit 'STATE=IN_PROGRESS'
+        exit 0
+    }
     $preference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $createText = @(& schtasks.exe /Create /TN 'WinRTCSCanaryInstall' /XML $xmlPath /F 2>&1 | ForEach-Object { "$_" }) -join "`n"
@@ -621,6 +662,11 @@ exit $code
     $cleanup = $false
     Emit ('RUN_ID=' + $runId)
     Emit 'WINRTCS_CANARY_STARTED=true'
+    Emit ('TASK_NAME=WinRTCSCanaryInstall')
+    Emit ('TASK_WRAPPER=' + $wrapperPath)
+    Emit ('STAGE_PATH=' + $stage)
+    Emit 'TASK_IDENTITY=S-1-5-18'
+    Emit 'FOREGROUND_RESULT=SCHEDULED_ONLY'
     Emit 'LOG=C:\ProgramData\WinRTCS\canary-install.log'
     Emit 'STATE=STARTED'
     exit 0
