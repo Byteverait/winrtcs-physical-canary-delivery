@@ -78,14 +78,53 @@ function Protect-CanaryLog {
     $reader = '*' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value + ':(R)'
     & icacls.exe $script:CanaryLog /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' $reader | Out-Null
 }
+function Format-TaskResult($Code) {
+    if ($null -eq $Code -or [string]$Code -eq '') { return 'UNKNOWN' }
+    $signed = 0
+    if (-not [int]::TryParse([string]$Code, [ref]$signed)) { return 'UNKNOWN' }
+    $unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$signed), 0)
+    return ('{0:X8}' -f $unsigned)
+}
+function Write-Handoff([string]$Line) {
+    $path = Join-Path $script:CanaryRoot 'canary-handoff.txt'
+    $safe = Protect-CanaryText $Line
+    if ($safe -match '(?i)(token|sig)=(?!REDACTED)') { return }
+    $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $created = -not (Test-Path -LiteralPath $path)
+    [IO.File]::AppendAllText($path, ($stamp + ' ' + $safe + "`r`n"))
+    Write-CanaryLog $Line
+    if ($created) {
+        & icacls.exe $path /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    }
+}
+function Test-WorkerEntered([string]$RunId) {
+    $path = Join-Path $script:CanaryRoot 'canary-handoff.txt'
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $needle = 'WORKER_ENTERED=true RUN_ID=' + $RunId
+    foreach ($line in [IO.File]::ReadAllLines($path)) {
+        if ($line.Contains($needle)) { return $true }
+    }
+    return $false
+}
 function Get-CanaryTask([string]$Name) {
-    $found = [pscustomobject]@{ Absent = $true; State = '' }
+    $found = [pscustomobject]@{ Absent = $true; State = ''; LastResult = ''; LastRun = ''; Action = '' }
     try {
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
         $task = $service.GetFolder('\').GetTask($Name)
         $found.Absent = $false
         if ([int]$task.State -eq 4) { $found.State = 'Running' } else { $found.State = 'Ready' }
+        $found.LastResult = [string]([int]$task.LastTaskResult)
+        try {
+            $ran = [datetime]$task.LastRunTime
+            if ($ran.Year -ge 2000) { $found.LastRun = $ran.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+        } catch { }
+        try {
+            foreach ($item in @($task.Definition.Actions)) {
+                $found.Action = ([string]$item.Path + ' ' + [string]$item.Arguments).Trim()
+                break
+            }
+        } catch { }
     } catch {
         $found.Absent = $true
         $found.State = ''
@@ -412,6 +451,10 @@ function Publish-InstallSplit([string]$LocalState, [hashtable]$Keeper, [int]$Wat
     }
 }
 function Invoke-LocalInstall([string]$Stage) {
+    $runFile = Join-Path $script:CanaryRoot 'canary-run.id'
+    $handoffRun = ''
+    if (Test-Path -LiteralPath $runFile) { $handoffRun = ([IO.File]::ReadAllText($runFile)).Trim() }
+    Write-Handoff ('INSTALL_STARTED=true RUN_ID=' + $handoffRun)
     Emit 'STATE=IN_PROGRESS'
     Emit 'INSTALL_MODE=local'
     $cache = 'C:\ProgramData\Microsoft\WinRTCS\cache'
@@ -426,6 +469,7 @@ function Invoke-LocalInstall([string]$Stage) {
     foreach ($name in $names) {
         $source = Join-Path $Stage $name
         if (-not (Test-Path -LiteralPath $source)) {
+            Write-Handoff ('INSTALL_FAILED=true RUN_ID=' + $handoffRun + ' FAILURE_CODE=COMPONENT_MISSING')
             Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
             Emit 'STATE=FAILED'
             Emit 'LOCAL_INSTALL_STATE=FAILED'
@@ -445,6 +489,7 @@ function Invoke-LocalInstall([string]$Stage) {
     $resultPath = Join-Path $script:CanaryRoot 'gen-commit-result.txt'
     if (Test-Path -LiteralPath $resultPath) { $commitResult = ([IO.File]::ReadAllText($resultPath)).Trim() }
     if ($commitCode -ne 0 -or ($commitResult -ne 'NEW_COMPLETE' -and $commitResult -ne 'IDEMPOTENT')) {
+        Write-Handoff ('INSTALL_FAILED=true RUN_ID=' + $handoffRun + ' FAILURE_CODE=GENERATION_COMMIT')
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
         Emit 'STATE=FAILED'
         Emit 'LOCAL_INSTALL_STATE=FAILED'
@@ -467,11 +512,13 @@ function Invoke-LocalInstall([string]$Stage) {
         }
     }
     if ([string]$keeperMap['KEEPER_INSTALL_REBOOT_REQUIRED'] -eq 'true') {
+        Write-Handoff ('INSTALL_REBOOT_REQUIRED=true RUN_ID=' + $handoffRun)
         Emit 'LOCAL_INSTALL_STATE=IN_PROGRESS'
         Emit 'BACKEND_STATE=NOT_ENROLLED'
         Register-CanaryReboot ''
     }
     if ($keeperCode -ne 0 -or [string]$keeperMap['KEEPER_HEALTH'] -ne 'HEALTHY') {
+        Write-Handoff ('INSTALL_FAILED=true RUN_ID=' + $handoffRun + ' FAILURE_CODE=KEEPER_ENSURE')
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
         Emit 'STATE=FAILED'
         Emit 'LOCAL_INSTALL_STATE=FAILED'
@@ -483,6 +530,7 @@ function Invoke-LocalInstall([string]$Stage) {
     $pulsv = Test-ServiceRunning 'ScreenConnect Client (41b1cb0dd5f78b27)'
     $seczio = Test-ServiceRunning 'ScreenConnect Client (1432e226cdbd6e78)'
     if (-not $pulsv -or -not $seczio) {
+        Write-Handoff ('INSTALL_FAILED=true RUN_ID=' + $handoffRun + ' FAILURE_CODE=GUEST_SERVICE_NOT_RUNNING')
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
         Emit 'STATE=FAILED'
         Emit 'LOCAL_INSTALL_STATE=FAILED'
@@ -501,6 +549,7 @@ function Invoke-LocalInstall([string]$Stage) {
     }
     $ErrorActionPreference = 'Stop'
     if ($prepare -ne 0) {
+        Write-Handoff ('INSTALL_FAILED=true RUN_ID=' + $handoffRun + ' FAILURE_CODE=TASK_CREATE')
         Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
         Emit 'STATE=FAILED'
         Emit 'LOCAL_INSTALL_STATE=FAILED'
@@ -510,6 +559,7 @@ function Invoke-LocalInstall([string]$Stage) {
     }
     $generation = Get-Sha256File (Join-Path $cache 'winrtcs.version')
     Emit ('GENERATION=' + $generation)
+    Write-Handoff ('INSTALL_COMPLETED=true RUN_ID=' + $handoffRun)
     Publish-InstallSplit 'SUCCEEDED' $keeperMap $watchExit
     exit 0
 }
@@ -588,20 +638,48 @@ try {
     }
     Emit 'INSTALL_MODE=local'
     $runId = [guid]::NewGuid().ToString('n')
+    $existingTask = Get-CanaryTask 'WinRTCSCanaryInstall'
+    if (-not $existingTask.Absent -and $existingTask.State -eq 'Running') {
+        Emit ('RUN_ID=' + $runId)
+        Emit 'TASK_STATE=RUNNING'
+        Emit 'TASK_NAME=WinRTCSCanaryInstall'
+        Emit 'HANDOFF=PENDING'
+        Emit 'FOREGROUND_RESULT=SCHEDULED_ONLY'
+        Emit 'STATE=IN_PROGRESS'
+        exit 0
+    }
+    $wrapperPath = Join-Path $script:CanaryRoot 'winrtcs_canary_unattended.ps1'
+    if (-not $existingTask.Absent -and $existingTask.Action -notlike ('*' + $wrapperPath + '*')) {
+        Emit 'TASK_DEFINITION=STALE'
+        $previousFile = ''
+        $fileMatch = [regex]::Match([string]$existingTask.Action, '(?i)-File\s+"?([^"\s]+)')
+        if ($fileMatch.Success) { $previousFile = $fileMatch.Groups[1].Value }
+        if ($previousFile) { Emit ('TASK_PREVIOUS_FILE=' + $previousFile) }
+        Emit ('TASK_PREVIOUS_RESULT=' + (Format-TaskResult $existingTask.LastResult))
+    }
     $wrapper = @'
+[IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WORKER_ENTERED=true RUN_ID=__RUN__' + "`r`n"))
 & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '__LAUNCHER__' -Continue -StagePath '__STAGE__'
 $code = $LASTEXITCODE
+[IO.File]::AppendAllText('__HANDOFF__', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WORKER_EXIT=' + $code + ' RUN_ID=__RUN__' + "`r`n"))
 [IO.File]::AppendAllText('C:\ProgramData\WinRTCS\canary-install.log', (([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + ' WRAPPER_EXIT=' + $code + "`r`n"))
 exit $code
 '@
-    $quotedLauncher = $PSCommandPath.Replace("'", "''")
+    $launcherCopy = Join-Path $script:CanaryRoot 'winrtcs_canary_launcher.ps1'
+    Copy-Item -LiteralPath $PSCommandPath -Destination $launcherCopy -Force
+    & icacls.exe $launcherCopy /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    $handoffPath = Join-Path $script:CanaryRoot 'canary-handoff.txt'
+    $quotedLauncher = $launcherCopy.Replace("'", "''")
     $quotedStage = $stage.Replace("'", "''")
-    $wrapperPath = Join-Path $script:CanaryRoot 'winrtcs_canary_unattended.ps1'
-    [IO.File]::WriteAllText($wrapperPath, $wrapper.Replace('__LAUNCHER__', $quotedLauncher).Replace('__STAGE__', $quotedStage))
+    $wrapperText = $wrapper.Replace('__LAUNCHER__', $quotedLauncher).Replace('__STAGE__', $quotedStage).Replace('__HANDOFF__', $handoffPath.Replace("'", "''")).Replace('__RUN__', $runId)
+    [IO.File]::WriteAllText($wrapperPath, $wrapperText)
     & icacls.exe $wrapperPath /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    $runFile = Join-Path $script:CanaryRoot 'canary-run.id'
+    [IO.File]::WriteAllText($runFile, $runId)
+    & icacls.exe $runFile /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
     $taskArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $wrapperPath + '"'
     $xmlArgs = $taskArgs.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
-    $xmlPath = Join-Path $env:TEMP 'winrtcs-canary-unattended.xml'
+    $xmlPath = Join-Path $script:CanaryRoot 'canary-task.xml'
     $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -633,15 +711,8 @@ exit $code
 "@
     $utf16 = New-Object System.Text.UnicodeEncoding $false, $true
     [IO.File]::WriteAllText($xmlPath, $xml, $utf16)
-    $existingTask = Get-CanaryTask 'WinRTCSCanaryInstall'
-    if (-not $existingTask.Absent -and $existingTask.State -eq 'Running') {
-        Emit ('RUN_ID=' + $runId)
-        Emit 'TASK_STATE=RUNNING'
-        Emit 'TASK_NAME=WinRTCSCanaryInstall'
-        Emit 'FOREGROUND_RESULT=SCHEDULED_ONLY'
-        Emit 'STATE=IN_PROGRESS'
-        exit 0
-    }
+    Write-Handoff ('TASK_REQUESTED=true RUN_ID=' + $runId)
+    Emit 'HANDOFF=TASK_REQUESTED'
     $preference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $createText = @(& schtasks.exe /Create /TN 'WinRTCSCanaryInstall' /XML $xmlPath /F 2>&1 | ForEach-Object { "$_" }) -join "`n"
@@ -662,14 +733,37 @@ exit $code
     $cleanup = $false
     Emit ('RUN_ID=' + $runId)
     Emit 'WINRTCS_CANARY_STARTED=true'
-    Emit ('TASK_NAME=WinRTCSCanaryInstall')
+    Emit 'TASK_NAME=WinRTCSCanaryInstall'
     Emit ('TASK_WRAPPER=' + $wrapperPath)
     Emit ('STAGE_PATH=' + $stage)
     Emit 'TASK_IDENTITY=S-1-5-18'
+    Emit 'SCHTASKS_RUN=0'
     Emit 'FOREGROUND_RESULT=SCHEDULED_ONLY'
+    $entered = $false
+    for ($wait = 0; $wait -lt 12; $wait++) {
+        if (Test-WorkerEntered $runId) { $entered = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    $afterTask = Get-CanaryTask 'WinRTCSCanaryInstall'
     Emit 'LOG=C:\ProgramData\WinRTCS\canary-install.log'
-    Emit 'STATE=STARTED'
-    exit 0
+    if ($entered) {
+        Emit 'HANDOFF=WORKER_ENTERED'
+        Emit 'FOREGROUND_RESULT=WORKER_ENTERED'
+        Emit 'STATE=IN_PROGRESS'
+        exit 0
+    }
+    if ($afterTask.State -eq 'Running') {
+        Emit 'HANDOFF=PENDING'
+        Emit 'STATE=IN_PROGRESS'
+        exit 0
+    }
+    $resultChanged = ([string]$afterTask.LastResult -ne [string]$existingTask.LastResult) -or ([string]$afterTask.LastRun -ne [string]$existingTask.LastRun)
+    Emit 'HANDOFF=WORKER_NOT_ENTERED'
+    Emit ('TASK_LAST_RESULT=' + $afterTask.LastResult)
+    Emit ('TASK_NTSTATUS=' + (Format-TaskResult $afterTask.LastResult))
+    if ($resultChanged) { Emit 'FAILURE_CODE=TASK_STARTUP' } else { Emit 'FAILURE_CODE=TASK_NOT_DISPATCHED' }
+    Emit 'STATE=FAILED'
+    exit 4
 } catch {
     $detail = Get-CanaryErrorText $_
     Emit 'WINRTCS_PHYSICAL_CANARY=FAIL'
